@@ -107,12 +107,17 @@ You only need this for **private accounts you follow** or **age-restricted posts
 > If you log out of TikTok, the session ID stops working and you need to copy a new one.
 > Using a **secondary account** is safer.
 
+The tool does not keep your session ID: it is only used while the command runs, and the temporary
+files that hold it are deleted afterwards.
+
 ## Problems?
 
 - **Can't get the post list:** run `pip install -U yt-dlp`
 - **Some posts failed:** see `failed.txt` in the output folder (link + reason for each post), then run the same command again
 - **Ad / TikTok Shop videos fail:** TikTok does not give a download link for these on the web, even when you are logged in. They are listed in `failed.txt` so you can open them yourself
 - **Private account:** add `--session-id <your sessionid cookie>`
+- **"No posts found":** the account is private or empty, or TikTok blocked the list for a while. Check the profile in your browser and try again later
+- **"(ffmpeg failed, saved without metadata)":** the video was downloaded and saved, only the title, cover and subtitles could not be added. Update ffmpeg if it keeps happening
 
 ## Contributing
 

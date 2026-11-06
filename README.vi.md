@@ -107,12 +107,17 @@ Chỉ cần khi tải **tài khoản riêng tư bạn đang theo dõi** hoặc *
 > Nếu bạn đăng xuất TikTok thì session ID sẽ hết hiệu lực, cần copy lại cái mới.
 > Nên dùng **tài khoản phụ** cho an toàn.
 
+Tool không lưu lại session ID của bạn: nó chỉ được dùng trong lúc lệnh đang chạy, các file tạm chứa
+session ID sẽ bị xoá ngay sau đó.
+
 ## Gặp lỗi?
 
 - **Không lấy được danh sách bài:** chạy `pip install -U yt-dlp`
 - **Vài bài bị lỗi:** xem file `failed.txt` trong thư mục tải (có link và lý do từng bài), rồi chạy lại đúng lệnh cũ
 - **Video quảng cáo / TikTok Shop bị lỗi:** TikTok không cung cấp link tải cho loại video này qua web, kể cả khi đã đăng nhập. Chúng được liệt kê trong `failed.txt` để bạn tự mở xem
 - **Tài khoản riêng tư:** thêm `--session-id <cookie sessionid của bạn>`
+- **"Không tìm thấy bài nào":** tài khoản đang để riêng tư, chưa có bài, hoặc TikTok tạm chặn. Mở profile bằng trình duyệt để kiểm tra, rồi thử lại sau
+- **"(ffmpeg lỗi, đã lưu video chưa gắn metadata)":** video vẫn được tải và lưu, chỉ thiếu tiêu đề, ảnh bìa và phụ đề. Nếu bị thường xuyên thì cập nhật ffmpeg
 
 ## Đóng góp
 
