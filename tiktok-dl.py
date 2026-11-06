@@ -1,9 +1,30 @@
 #!/usr/bin/env python3
-"""tiktok-dl - tải toàn bộ video của một profile TikTok.
+"""tiktok-dl - download every video from a TikTok profile.
 
-Danh sách bài đăng lấy bằng yt-dlp, metadata từng bài đọc từ trang TikTok
-(__UNIVERSAL_DATA_FOR_REHYDRATION__), file tải bằng aria2c rồi mux bằng ffmpeg
-(gắn metadata, ảnh bìa, phụ đề; bài ảnh được dựng thành video slideshow).
+How it works
+------------
+1. List posts      list_posts()      yt-dlp's TikTok user extractor (flat list of post ids).
+2. Read metadata   TikTok.item()     each post page embeds its data in
+                                     <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">.
+3. Plan downloads  Post              video / cover / subtitles, or images + music for photo posts.
+4. Download        download_aria2()  aria2c, one URL per file per attempt (falls back to requests).
+5. Mux             finalize()        ffmpeg adds metadata, cover and subtitles; photo posts become
+                                     MP4 slideshows (mux_slideshow).
+
+scrape_profile() runs steps 2-5 in batches and overlaps them: while aria2c downloads one batch,
+the next batch's metadata is read and the previous batch is muxed in the background.
+
+Code map
+--------
+Console output   log(), status(), colors, ProgressBar   (all user-facing text goes through t())
+Helpers          parse_target(), resolve_short_link(), sanitize(), ...
+TikTok client    class TikTok
+Metadata         flatten() -> videos.csv row, mux_tags() -> MP4 tags
+Progress         class Progress (SQLite, lets a re-run skip finished posts)
+Download / mux   class Post, download_aria2(), download_requests(), mux_video(), mux_slideshow()
+Main flow        scrape_profile(), main()
+
+Messages are bilingual: t("English", "Tiếng Việt"). Please add both when you add a message.
 """
 from __future__ import annotations
 
@@ -34,12 +55,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REHYDRATION_RE = re.compile(
     r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S)
 
-# Ngôn ngữ thông báo: "en" (mặc định) hoặc "vi". Đặt bằng --lang hoặc biến môi trường TIKTOK_DL_LANG.
+# Message language: "en" (default) or "vi". Set with --lang or the TIKTOK_DL_LANG environment variable.
 LANG = "en"
 
 
 def t(en: str, vi: str) -> str:
-    """Chọn câu thông báo theo ngôn ngữ đang dùng."""
+    """Pick the message for the current language."""
     return vi if LANG == "vi" else en
 
 
@@ -81,7 +102,55 @@ if hasattr(sys.stdout, "reconfigure"):
 # --------------------------------------------------------------------------- #
 
 _print_lock = threading.RLock()
-_status_line = ""   # dòng trạng thái luôn nằm dưới cùng (thanh tiến độ)
+_status_line = ""   # status line kept at the bottom (progress bar)
+_COLOR = False      # turned on in main() when running in a terminal
+_TTY = sys.stdout.isatty()
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _style(code: str):
+    return lambda s: f"\x1b[{code}m{s}\x1b[0m" if _COLOR else str(s)
+
+
+bold = _style("1")
+dim = _style("2")
+gray = _style("90")
+red = _style("31")
+green = _style("32")
+yellow = _style("33")
+blue = _style("34")
+magenta = _style("35")
+cyan = _style("36")
+bold_red = _style("1;31")
+bold_green = _style("1;32")
+bold_cyan = _style("1;36")
+link = _style("4;34")
+
+
+def init_colors(enabled: bool) -> None:
+    """Enable ANSI colors when running in a terminal (Windows 10+ needs VT mode switched on)."""
+    global _COLOR
+    forced = bool(os.environ.get("FORCE_COLOR"))   # e.g. keep colors when output is redirected to a file
+    if not enabled or os.environ.get("NO_COLOR") or not (_TTY or forced):
+        _COLOR = False
+        return
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            for handle_id in (-11, -12):   # stdout, stderr
+                handle = kernel32.GetStdHandle(handle_id)
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            _COLOR = False
+            return
+    _COLOR = True
+
+
+def visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
 
 
 def _width() -> int:
@@ -89,19 +158,23 @@ def _width() -> int:
 
 
 def _clear_status() -> None:
-    if _status_line:
+    if _status_line and _TTY:
         sys.stdout.write("\r" + " " * _width() + "\r")
 
 
 def _draw_status() -> None:
-    if _status_line:
-        w = _width()
-        sys.stdout.write("\r" + _status_line[:w].ljust(w))
-        sys.stdout.flush()
+    if not (_status_line and _TTY):
+        return
+    w = _width()
+    line = _status_line
+    if visible_len(line) > w:   # too long: drop colors and cut to fit
+        line = _ANSI_RE.sub("", line)[:w]
+    sys.stdout.write("\r" + line + " " * max(0, w - visible_len(line)))
+    sys.stdout.flush()
 
 
 def log(msg: str = "", err: bool = False) -> None:
-    """In một dòng log phía trên thanh tiến độ, rồi vẽ lại thanh tiến độ."""
+    """Print a log line above the progress bar, then redraw the bar."""
     with _print_lock:
         _clear_status()
         sys.stdout.flush()
@@ -110,12 +183,16 @@ def log(msg: str = "", err: bool = False) -> None:
 
 
 def status(msg: str) -> None:
-    """Đặt dòng trạng thái dưới cùng (chuỗi rỗng = xoá)."""
+    """Set the bottom status line (empty string clears it). Only shown in a terminal."""
     global _status_line
     with _print_lock:
         _clear_status()
         _status_line = msg
         _draw_status()
+
+
+def warn(msg: str) -> str:
+    return f"  {yellow('!')} {yellow(msg)}"
 
 
 def fmt_eta(seconds: Optional[float]) -> str:
@@ -126,12 +203,13 @@ def fmt_eta(seconds: Optional[float]) -> str:
 
 
 class ProgressBar:
-    """Thanh tiến độ tổng cho cả profile, vẽ lại 4 lần/giây.
+    """Overall progress bar for one profile, redrawn 8 times per second.
 
-    % và ETA tính theo số bài đã xong (không nhảy), tốc độ là trung bình trượt 5 giây.
+    Percentage and ETA are based on finished posts (so they do not jump around);
+    speed is a 5-second moving average of downloaded bytes.
     """
 
-    WIDTH = 28
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def __init__(self, total: int):
         self.total = max(1, total)
@@ -140,6 +218,7 @@ class ProgressBar:
         self.active: list = []
         self.samples: list[tuple[float, int]] = []
         self.started = time.monotonic()
+        self.frame = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -151,7 +230,6 @@ class ProgressBar:
     def __exit__(self, *exc):
         self._stop.set()
         self._thread.join()
-        self.render()
         status("")
 
     def post_done(self, ok: bool) -> None:
@@ -183,8 +261,24 @@ class ProgressBar:
         return total
 
     def _loop(self) -> None:
-        while not self._stop.wait(0.25):
+        while not self._stop.wait(0.125):
             self.render()
+
+    @staticmethod
+    def _bar(frac: float, width: int) -> str:
+        if _COLOR:
+            # "━━━━━╸━━━━" style: the done part is colored, with half-cell precision.
+            halves = int(frac * width * 2)
+            full, half = divmod(halves, 2)
+            done = "━" * full + ("╸" if half else "")
+            rest = "━" * (width - full - (1 if half else 0))
+            color = green if frac >= 1 else cyan
+            return color(done) + gray(rest)
+        # No colors: use solid / shaded blocks so done and remaining still look different.
+        eighths = int(frac * width * 8)
+        full, part = divmod(eighths, 8)
+        partial = " ▏▎▍▌▋▊▉"[part] if part else ""
+        return "█" * full + partial + "░" * (width - full - (1 if partial else 0))
 
     def render(self) -> None:
         now = time.monotonic()
@@ -194,16 +288,27 @@ class ProgressBar:
         speed = (got - b0) / (now - t0) if now - t0 >= 0.5 else 0.0
         finished = self.ok + self.failed
         frac = min(1.0, finished / self.total)
-        filled = int(frac * self.WIDTH)
-        bar = "█" * filled + "░" * (self.WIDTH - filled)
         elapsed = now - self.started
         eta = elapsed / finished * (self.total - finished) if finished else None
+        self.frame = (self.frame + 1) % len(self.SPINNER)
         digits = len(str(self.total))
-        line = (f"  {bar} {frac * 100:5.1f}%  {finished:>{digits}}/{self.total} {t('posts', 'bài')}"
-                f"  {fmt_bytes(got):>8}  {fmt_bytes(speed) + '/s':>10}  ETA {fmt_eta(eta):>7}")
-        if self.failed:
-            line += f"  ✗ {self.failed}"
-        status(line)
+        sep = gray(" │ ")
+
+        spinner = cyan(self.SPINNER[self.frame]) if _COLOR else ""
+        parts = [
+            bold(f"{frac * 100:5.1f}%"),
+            f"{finished:>{digits}}/{self.total} {t('posts', 'bài')}",
+            f"{fmt_bytes(got):>8}",
+            cyan(f"{fmt_bytes(speed) + '/s':>10}"),
+            f"ETA {yellow(f'{fmt_eta(eta):>7}')}",
+        ]
+        # The failure column is always shown with a fixed width so the bar does not shrink when failures start.
+        fails = f"✗ {self.failed:<{digits}}"
+        parts.append(red(fails) if self.failed else gray(fails))
+        tail = sep.join(parts)
+        prefix = f"  {spinner} " if spinner else "  "
+        bar_w = max(10, min(40, _width() - visible_len(prefix) - visible_len(tail) - 3))
+        status(f"{prefix}{self._bar(frac, bar_w)}  {tail}")
 
 
 def fmt_bytes(n: float) -> str:
@@ -232,7 +337,7 @@ class ScrapeError(Exception):
 
 
 def find_tool(name: str) -> Optional[str]:
-    """Ưu tiên file chạy nằm cạnh tiktok-dl.py (vd aria2c.exe, ffmpeg.exe), sau đó tới PATH."""
+    """Prefer an executable next to tiktok-dl.py (e.g. aria2c.exe, ffmpeg.exe), then PATH."""
     for cand in (SCRIPT_DIR / f"{name}.exe", SCRIPT_DIR / name):
         if cand.is_file():
             return str(cand)
@@ -254,7 +359,7 @@ SHORT_LINK_RE = re.compile(r"^(?:https?://)?(?:(?:vt|vm)\.tiktok\.com/|(?:www\.)
 
 
 def resolve_short_link(text: str) -> str:
-    """Đổi link rút gọn (vt.tiktok.com/..., vm.tiktok.com/..., tiktok.com/t/...) thành link đầy đủ."""
+    """Expand a short link (vt.tiktok.com/..., vm.tiktok.com/..., tiktok.com/t/...) to the full URL."""
     if not SHORT_LINK_RE.match(text):
         return text
     url = text if text.lower().startswith("http") else f"https://{text}"
@@ -274,7 +379,7 @@ def resolve_short_link(text: str) -> str:
 
 
 def parse_target(text: str) -> tuple[str, Optional[str]]:
-    """'user', '@user', link profile hoặc link một video -> (username, video_id | None)."""
+    """'user', '@user', a profile link or a video link -> (username, video_id | None)."""
     raw = resolve_short_link(text.strip())
     m = re.search(r"tiktok\.com/@([^/?#\s]+)(?:/(?:video|photo)/(\d+))?", raw, re.I)
     name, vid = (m.group(1), m.group(2)) if m else (raw.lstrip("@"), None)
@@ -325,7 +430,7 @@ class TikTok:
         })
         if proxy:
             self.s.proxies = {"http": proxy, "https": proxy}
-        # Dùng phiên đăng nhập (cookie sessionid) của chính bạn.
+        # Use the user's own login session (sessionid cookie).
         if session_id:
             for name in ("sessionid", "sessionid_ss", "sid_tt"):
                 self.s.cookies.set(name, session_id, domain=".tiktok.com")
@@ -377,9 +482,9 @@ class TikTok:
         return data["itemInfo"]["itemStruct"]
 
     def whoami(self) -> Optional[dict]:
-        """Tài khoản đang đăng nhập theo cookie hiện tại, hoặc None nếu chưa đăng nhập.
+        """The account logged in with the current cookies, or None when logged out.
 
-        Khi cookie sessionid hợp lệ, trang TikTok nhúng thông tin người dùng vào webapp.app-context.
+        With a valid sessionid cookie, TikTok pages embed the user in webapp.app-context.
         """
         data = self._scope("https://www.tiktok.com/explore", "webapp.app-context")
         user = data.get("user") or {}
@@ -390,21 +495,21 @@ class TikTok:
 
 
 def list_posts(username: str, limit: Optional[int], cookiefile: Optional[str]) -> list[dict]:
-    """Danh sách toàn bộ bài đăng của profile, mới nhất trước (yt-dlp TikTokUser)."""
+    """Every post of the profile, newest first (yt-dlp TikTokUser extractor)."""
     import yt_dlp
 
     class Quiet:
         def debug(self, msg):
             m = re.search(r"Downloading page (\d+)", msg)
             if m:
-                status(t(f"  Getting post list... page {m.group(1)}", f"  Đang lấy danh sách bài đăng... trang {m.group(1)}"))
+                status(gray(t(f"  Getting post list... page {m.group(1)}", f"  Đang lấy danh sách bài đăng... trang {m.group(1)}")))
         info = debug
 
         def warning(self, msg):
             pass
 
         def error(self, msg):
-            log(f"  {msg}", err=True)
+            log(f"  {red(msg)}", err=True)
 
     opts = {"extract_flat": "in_playlist", "skip_download": True, "logger": Quiet(), "no_warnings": True}
     if limit:
@@ -495,7 +600,7 @@ def flatten(item: dict) -> dict:
 
 
 def mux_tags(item: dict) -> dict:
-    """Metadata ghi vào file MP4 (Explorer / VLC / MediaInfo đọc được)."""
+    """Tags written into the MP4 (readable by Explorer / VLC / MediaInfo)."""
     f = flatten(item)
     when = created_at(item)
     desc = item.get("desc") or ""
@@ -559,7 +664,7 @@ class Post:
         self.base = base_name(item)
         self.work = work / self.id
         self.tasks: list[tuple[list[str], Path, int]] = []   # (mirrors, dest, expected size)
-        self.hidden: Optional[str] = None                    # lý do nếu TikTok không trả link tải
+        self.hidden: Optional[str] = None                    # reason when TikTok gives no download link
         video = item.get("video") or {}
         images = (item.get("imagePost") or {}).get("images") or []
         self.is_slide = bool(images)
@@ -576,13 +681,13 @@ class Post:
                 self.tasks.append(([play], self.audio, 0))
             return
 
-        # Các link này KHÔNG phải mirror của cùng một file: www.tiktok.com/aweme/v1/play trả HTML,
-        # downloadAddr là bản có watermark. aria2c chỉ dùng một link mỗi lượt, lỗi thì thử link sau.
+        # These URLs are NOT mirrors of the same file: www.tiktok.com/aweme/v1/play returns HTML and
+        # downloadAddr is the watermarked version. aria2c uses one URL per attempt, then the next one.
         struct = video.get("PlayAddrStruct") or {}
         mirrors = uniq([video.get("playAddr"), *(struct.get("UrlList") or []), video.get("downloadAddr")])
         mirrors = [u for u in mirrors if "/aweme/v1/play" not in u]
         if not mirrors:
-            # TikTok cố ý không trả link video cho người chưa đăng nhập, hay gặp ở bài quảng cáo / TikTok Shop.
+            # TikTok withholds the video URL on purpose, typically for ad / TikTok Shop posts.
             if item.get("isAd") or item.get("isECVideo"):
                 self.hidden = t("ad / TikTok Shop video: TikTok does not provide a download link on the web "
                                 "(even when logged in)",
@@ -616,7 +721,7 @@ class Post:
 
 
 def is_valid_file(dest: Path) -> bool:
-    """Loại các file 'tải xong' nhưng thực ra là trang HTML/JSON báo lỗi."""
+    """Reject "finished" downloads that are really HTML/JSON error pages."""
     try:
         if not dest.is_file() or dest.stat().st_size < 64 or Path(f"{dest}.aria2").exists():
             return False
@@ -678,7 +783,7 @@ def download_requests(session: requests.Session, tasks, jobs: int) -> None:
                                 fh.write(chunk)
                     if is_valid_file(dest):
                         return
-                    break  # tải được nhưng là trang lỗi: sang link khác
+                    break  # got an error page instead of media: try the next URL
                 except requests.RequestException:
                     time.sleep(1)
         dest.unlink(missing_ok=True)
@@ -728,7 +833,7 @@ def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
             cmd += [f"-metadata:s:s:{i}", f"language={lang}"]
         return cmd + tags + ["-movflags", "+faststart", str(out)]
 
-    # Nếu ảnh bìa (có thể là HEIC/WebP lạ) hoặc phụ đề làm ffmpeg lỗi thì bỏ dần từng thứ.
+    # If the cover (sometimes an odd HEIC/WebP) or a subtitle breaks ffmpeg, drop them one at a time.
     notes = []
     for with_cover, with_subs in ((True, True), (False, True), (False, False)):
         ok, err = run_ffmpeg(build(with_cover, with_subs))
@@ -740,9 +845,9 @@ def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
 
 def mux_slideshow(ffmpeg: str, post: Post, out: Path, seconds: float) -> None:
     images = [p for p in post.images if p.exists() and p.stat().st_size]
-    # Mỗi ảnh là một input riêng (lặp trong `seconds` giây), được đưa về khung 1080x1920 trước rồi mới nối.
-    # Không dùng concat demuxer: ảnh trong một bài thường lệch kích thước vài pixel, ffmpeg phải dựng lại
-    # bộ lọc giữa chừng và làm mất các khung hình đầu (video bắt đầu trễ vài giây).
+    # Each image is its own input (looped for `seconds`), scaled/padded to 1080x1920, then joined.
+    # The concat demuxer is not used: images in one post often differ by a few pixels, which makes
+    # ffmpeg rebuild its filters mid-stream and drop the first frames (video starts seconds late).
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for p in images:
         cmd += ["-loop", "1", "-framerate", "30", "-t", str(seconds), "-i", str(p.resolve())]
@@ -827,8 +932,8 @@ def save_profile(tt: TikTok, username: str, out_dir: Path) -> Optional[dict]:
     except ScrapeError as e:
         if e.code in FATAL_PROFILE_CODES:
             raise ScrapeError(f"@{username}: {e}", e.code)
-        log(t(f"  ! Could not read profile info ({e}), continuing.",
-              f"  ! Không đọc được thông tin profile ({e}), vẫn tiếp tục."))
+        log(warn(t(f"Could not read profile info ({e}), continuing.",
+                   f"Không đọc được thông tin profile ({e}), vẫn tiếp tục.")))
         return None
     (out_dir / "profile.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     avatar = (info.get("user") or {}).get("avatarLarger")
@@ -866,14 +971,15 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     work.mkdir(exist_ok=True)
     tt = TikTok(opts.session_id, opts.wait, opts.proxy)
 
-    log(f"\n=== @{username} ===")
+    log("\n" + bold_cyan(f"━━ @{username} ") + gray("━" * max(4, 40 - len(username))))
     info = save_profile(tt, username, out_dir)
     if info:
         u, st = info.get("user") or {}, info.get("stats") or {}
-        log(f"  {u.get('nickname', username)}{' ✓' if u.get('verified') else ''} · "
-            f"{fmt_int(st.get('followerCount'))} {t('followers', 'follower')} · "
-            f"{fmt_int(st.get('heartCount'))} {t('likes', 'tim')} · "
-            f"{fmt_int(st.get('videoCount'))} {t('posts', 'bài đăng')}")
+        dot = gray(" · ")
+        log(f"  {bold(u.get('nickname', username))}{cyan(' ✓') if u.get('verified') else ''}{dot}"
+            f"{bold(fmt_int(st.get('followerCount')))} {gray(t('followers', 'follower'))}{dot}"
+            f"{bold(fmt_int(st.get('heartCount')))} {gray(t('likes', 'tim'))}{dot}"
+            f"{bold(fmt_int(st.get('videoCount')))} {gray(t('posts', 'bài đăng'))}")
 
     if single:
         entries = [{"id": single}]
@@ -883,7 +989,8 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             entries = list_posts(username, opts.limit, cookiefile)
         finally:
             status("")
-        log(t(f"  Found {len(entries)} posts.", f"  Tìm thấy {len(entries)} bài đăng."))
+        found = bold(len(entries))
+        log(gray(t("  Found ", "  Tìm thấy ")) + found + gray(t(" posts.", " bài đăng.")))
 
     progress = Progress(out_dir / ".progress.db")
     if opts.metadata_only:
@@ -892,14 +999,15 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
         pending = [e for e in entries if not progress.done(str(e["id"]), out_dir)]
     if len(pending) < len(entries):
         skipped = len(entries) - len(pending)
-        log(t(f"  Skipping {skipped} posts already downloaded.", f"  Bỏ qua {skipped} bài đã có."))
+        log(gray(t(f"  Skipping {skipped} posts already downloaded.", f"  Bỏ qua {skipped} bài đã có.")))
 
     n = len(pending)
     if not n:
-        log(t("  Nothing left to download.", "  Không còn bài nào cần tải."))
+        log(green(t("  ✓ Nothing left to download.", "  ✓ Không còn bài nào cần tải.")))
         write_csv(out_dir)
         return 0
-    log(t(f"  Processing {n} post{'s' if n != 1 else ''} → {out_dir.resolve()}\n", f"  Bắt đầu xử lý {n} bài → {out_dir.resolve()}\n"))
+    log(gray(t(f"  Processing {n} post{'s' if n != 1 else ''} → ", f"  Bắt đầu xử lý {n} bài → "))
+        + blue(str(out_dir)) + "\n")
     started = time.monotonic()
     tally = {"ok": 0, "failed": 0, "bytes": 0, "dl_bytes": 0, "dl_secs": 0.0}
     tally_lock = threading.Lock()
@@ -914,14 +1022,14 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             tally["ok"] += 1
             tally["bytes"] += size
         bar.post_done(True)
-        log(f"  ✓ {line}")
+        log(f"  {bold_green('✓')} {line}")
 
     def fail(url: str, reason: str) -> None:
         with tally_lock:
             tally["failed"] += 1
             failures.append((url, reason))
         bar.post_done(False)
-        log(f"  ✗ {url}\n      └ {reason}")
+        log(f"  {bold_red('✗')} {link(url)}\n      {gray('└')} {yellow(reason)}")
 
     def fetch(entry):
         try:
@@ -941,12 +1049,13 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             fail(post.url, str(e))
             return
         progress.mark(post.id, "done", file=name)
-        kind = "[slideshow] " if post.is_slide else ""
-        succeed(f"{kind}{name}  {fmt_bytes(size)}{f'  ({note})' if note else ''}", size)
+        kind = magenta("[slideshow] ") if post.is_slide else ""
+        extra = f"  {yellow('(' + note + ')')}" if note else ""
+        succeed(f"{kind}{name}  {gray(fmt_bytes(size))}{extra}", size)
 
-    # Chạy gối đầu 3 bước: trong lúc aria2c tải lô hiện tại thì lô sau đang được đọc metadata,
-    # còn các lô đã tải xong được ffmpeg mux ở nền. Mỗi lần chỉ đọc trước 1 lô vì link tải
-    # của TikTok hết hạn sau vài giờ.
+    # The 3 steps overlap: while aria2c downloads the current batch, the next batch's metadata is
+    # read and finished batches are muxed by ffmpeg in the background. Only one batch is read
+    # ahead because TikTok download URLs expire after a few hours.
     batches = [pending[i:i + opts.batch] for i in range(0, n, opts.batch)]
     meta_pool = ThreadPoolExecutor(1)
     mux_pool = ThreadPoolExecutor(opts.mux_jobs)
@@ -971,7 +1080,7 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                                                     ensure_ascii=False, indent=2), encoding="utf-8")
                     if opts.metadata_only:
                         progress.mark(pid, "metadata")
-                        succeed(f"metadata {pid}")
+                        succeed(f"{gray('metadata')} {pid}")
                         continue
                     post = Post(item, work, opts)
                     if post.hidden:
@@ -984,7 +1093,7 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
 
                 tasks = [t for p in posts for t in p.tasks]
                 bar.downloading(tasks)
-                # File đã tải xong từ lần chạy trước không được tính vào tốc độ.
+                # Files finished in an earlier run do not count towards the speed.
                 already = sum(d.stat().st_size for _, d, _ in tasks if is_valid_file(d))
                 t0 = time.monotonic()
                 try:
@@ -1027,17 +1136,22 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
         failed_file.unlink(missing_ok=True)
 
     secs = max(1.0, time.monotonic() - started)
-    speed = f" · aria2c {fmt_bytes(tally['dl_bytes'] / tally['dl_secs'])}/s" if tally["dl_secs"] > 0 else ""
-    log(t(f"\n  ── Done @{username} ──", f"\n  ── Xong @{username} ──"))
-    log(f"  ✓ {ok} {t('done', 'thành công')}   ✗ {failed} {t('failed', 'lỗi')}"
-        + (f"   · {fmt_bytes(total_bytes)} {t('in', 'trong')} {fmt_eta(secs)}{speed}" if total_bytes else ""))
-    log(t(f"  Folder: {out_dir.resolve()}  (videos.csv: {rows} post{'s' if rows != 1 else ''})",
-          f"  Thư mục: {out_dir.resolve()}  (videos.csv: {rows} bài)"))
+    dot = gray(" · ")
+    speed = (f"{dot}aria2c {cyan(fmt_bytes(tally['dl_bytes'] / tally['dl_secs']) + '/s')}"
+             if tally["dl_secs"] > 0 else "")
+    title = t(f"Done @{username} ", f"Xong @{username} ")
+    log("\n" + bold(f"  ━━ {title}") + gray("━" * max(4, 36 - len(title))))
+    counts = (f"  {bold_green('✓ ' + str(ok))} {t('done', 'thành công')}   "
+              + (bold_red(f"✗ {failed}") if failed else gray("✗ 0")) + f" {t('failed', 'lỗi')}")
+    if total_bytes:
+        counts += f"{dot}{bold(fmt_bytes(total_bytes))} {t('in', 'trong')} {fmt_eta(secs)}{speed}"
+    log(counts)
+    log(gray(t("  Folder: ", "  Thư mục: ")) + blue(str(out_dir))
+        + gray(t(f"  (videos.csv: {rows} post{'s' if rows != 1 else ''})", f"  (videos.csv: {rows} bài)")))
     if failures:
-        log(t(f"  Failed posts with links: {failed_file.resolve()}",
-              f"  Danh sách bài lỗi kèm link: {failed_file.resolve()}"))
-        log(t("  Run the same command again to retry failed posts (finished posts are skipped).",
-              "  Chạy lại đúng lệnh cũ để thử lại các bài lỗi (bài đã xong sẽ được bỏ qua)."))
+        log(yellow(t("  Failed posts with links: ", "  Danh sách bài lỗi kèm link: ")) + blue(str(failed_file)))
+        log(gray(t("  Run the same command again to retry failed posts (finished posts are skipped).",
+                   "  Chạy lại đúng lệnh cũ để thử lại các bài lỗi (bài đã xong sẽ được bỏ qua).")))
     return failed
 
 
@@ -1112,9 +1226,12 @@ def main() -> None:
     p.add_argument("--lang", choices=("en", "vi"), default=LANG,
                    help=t("message language: en = English, vi = Vietnamese (default: auto)",
                           "ngôn ngữ thông báo: en = tiếng Anh, vi = tiếng Việt (mặc định: tự nhận)"))
+    p.add_argument("--no-color", dest="color", action="store_false",
+                   help=t("plain text output without colors", "in chữ trơn, không màu"))
     p.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     opts = p.parse_args()
     LANG = opts.lang
+    init_colors(opts.color)
     opts.jobs = max(1, min(32, opts.jobs))
     opts.connections = max(1, min(16, opts.connections))
     opts.workers = max(1, min(16, opts.workers))
@@ -1130,27 +1247,29 @@ def main() -> None:
         try:
             me = TikTok(opts.session_id, 0, opts.proxy).whoami()
         except ScrapeError as e:
-            log(t(f"Error: could not check the session ({e})", f"Lỗi: không kiểm tra được session ({e})"), err=True)
+            log(bold_red(t("Error: ", "Lỗi: ")) + red(t(f"could not check the session ({e})", f"không kiểm tra được session ({e})")),
+                err=True)
             sys.exit(1)
         if not me:
-            log(t("✗ Session ID is invalid or expired (TikTok treats you as logged out).\n"
-                  "  Copy a new sessionid cookie (see README, 'Get your session ID').",
-                  "✗ Session ID không hợp lệ hoặc đã hết hạn (TikTok coi như chưa đăng nhập).\n"
-                  "  Hãy lấy lại cookie sessionid mới (xem README, mục lấy session ID)."), err=True)
+            log(bold_red(t("✗ Session ID is invalid or expired (TikTok treats you as logged out).",
+                           "✗ Session ID không hợp lệ hoặc đã hết hạn (TikTok coi như chưa đăng nhập).")) + "\n"
+                + yellow(t("  Copy a new sessionid cookie (see README, 'Get your session ID').",
+                           "  Hãy lấy lại cookie sessionid mới (xem README, mục lấy session ID).")), err=True)
             sys.exit(1)
         nick = f" ({me['nickName']})" if me.get("nickName") else ""
-        log(t(f"✓ Session OK: logged in as @{me['uniqueId']}{nick}",
-              f"✓ Session hợp lệ: đang đăng nhập là @{me['uniqueId']}{nick}"))
+        log(bold_green("✓ ") + green(t("Session OK: logged in as ", "Session hợp lệ: đang đăng nhập là "))
+            + bold(f"@{me['uniqueId']}") + gray(nick))
         if opts.check_session:
             sys.exit(0)
 
     aria2 = find_tool("aria2c")
     ffmpeg = find_ffmpeg()
     if not opts.metadata_only:
-        log(t("Downloader: ", "Bộ tải: ") + (aria2 or t("requests (aria2c not found, slower)",
-                                                         "requests (không tìm thấy aria2c, sẽ chậm hơn)")))
-        log("ffmpeg: " + (ffmpeg or t("not found (no metadata in videos, no slideshows for photo posts)",
-                                      "không có (video sẽ không được gắn metadata, bài ảnh không dựng slideshow)")))
+        log(gray(t("Downloader: ", "Bộ tải:     ")) + (green("aria2c") + gray(f"  {aria2}") if aria2 else
+            yellow(t("requests (aria2c not found, slower)", "requests (không tìm thấy aria2c, sẽ chậm hơn)"))))
+        log(gray("ffmpeg:     ") + (green("ffmpeg") + gray(f"  {ffmpeg}") if ffmpeg else
+            yellow(t("not found (no metadata in videos, no slideshows for photo posts)",
+                     "không có (video sẽ không được gắn metadata, bài ảnh không dựng slideshow)"))))
 
     failed = 0
     try:
@@ -1159,10 +1278,10 @@ def main() -> None:
                 failed += scrape_profile(target, opts, aria2, ffmpeg)
             except ScrapeError as e:
                 failed += 1
-                log(t(f"Error: {e}", f"Lỗi: {e}"), err=True)
+                log(bold_red(t("Error: ", "Lỗi: ")) + red(str(e)), err=True)
     except KeyboardInterrupt:
-        log(t("\nStopped. Run the same command again to continue.",
-              "\nĐã dừng. Chạy lại đúng lệnh cũ để tải tiếp."), err=True)
+        log("\n" + yellow(t("Stopped. Run the same command again to continue.",
+                             "Đã dừng. Chạy lại đúng lệnh cũ để tải tiếp.")), err=True)
         sys.exit(130)
     sys.exit(1 if failed else 0)
 
