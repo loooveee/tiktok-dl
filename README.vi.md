@@ -44,9 +44,9 @@ python tiktok-dl.py username
 **Các cách nhập profile** (đều cho kết quả giống nhau):
 
 ```bash
-python tiktok-dl.py .aaapaathy
-python tiktok-dl.py https://www.tiktok.com/@.aaapaathy
-python tiktok-dl.py "@.aaapaathy"
+python tiktok-dl.py .user.name
+python tiktok-dl.py https://www.tiktok.com/@.user.name
+python tiktok-dl.py "@.user.name"
 ```
 
 > [!NOTE]
