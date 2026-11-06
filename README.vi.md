@@ -9,7 +9,7 @@ Tải toàn bộ video của một profile TikTok, kèm đầy đủ thông tin.
 
 - Tải nhanh bằng **aria2c**
 - **ffmpeg** gắn tiêu đề, tác giả, ngày đăng, mô tả, lượt xem, ảnh bìa, phụ đề vào từng file MP4
-- Bài đăng dạng ảnh được ghép thành video slideshow
+- Bài đăng dạng ảnh được lưu thành video slideshow **và** từng ảnh riêng (kèm nhạc)
 - Lưu toàn bộ thông tin vào `videos.csv` và `metadata/*.json`
 - Tắt giữa chừng thì chạy lại để tải tiếp
 
@@ -27,20 +27,36 @@ Tải toàn bộ video của một profile TikTok, kèm đầy đủ thông tin.
 ## Cách dùng
 
 ```bash
-python tiktok-dl.py @username
+python tiktok-dl.py username
 ```
 
 | Lệnh | Tác dụng |
 |---|---|
-| `python tiktok-dl.py @username` | Tải hết profile |
-| `python tiktok-dl.py @username -n 20` | Chỉ tải 20 bài mới nhất |
-| `python tiktok-dl.py @username -o D:\TikTok` | Lưu vào thư mục khác |
-| `python tiktok-dl.py @username --metadata-only` | Chỉ lấy thông tin, không tải video |
+| `python tiktok-dl.py username` | Tải hết profile |
+| `python tiktok-dl.py username -n 20` | Chỉ tải 20 bài mới nhất |
+| `python tiktok-dl.py username -o D:\TikTok` | Lưu vào thư mục khác |
+| `python tiktok-dl.py username --metadata-only` | Chỉ lấy thông tin, không tải video |
 | `python tiktok-dl.py <link video>` | Tải một video |
 | `python tiktok-dl.py https://vt.tiktok.com/XXXXXXXXX/` | Link rút gọn copy từ app TikTok cũng được |
-| `python tiktok-dl.py @username --lang vi` | Hiện thông báo bằng tiếng Việt |
+| `python tiktok-dl.py username --lang vi` | Hiện thông báo bằng tiếng Việt |
+| `python tiktok-dl.py username --no-images` | Bài ảnh: chỉ lưu video slideshow |
+
+**Các cách nhập profile** (đều cho kết quả giống nhau):
+
+```bash
+python tiktok-dl.py .aaapaathy
+python tiktok-dl.py https://www.tiktok.com/@.aaapaathy
+python tiktok-dl.py "@.aaapaathy"
+```
+
+> [!NOTE]
+> Trong **PowerShell**, ký tự `@` có nghĩa đặc biệt. Gõ username không có `@`, hoặc đặt trong dấu nháy.
 
 File được lưu trong `downloads/<username>/`.
+
+**Bài đăng dạng ảnh** được lưu đủ ba kiểu: video slideshow MP4 có nhạc, từng ảnh JPG riêng
+(`..._01.jpg`, `..._02.jpg`, ...) và nhạc nền MP3. Dùng `--no-images` nếu chỉ muốn slideshow,
+hoặc `--no-slideshow` nếu chỉ muốn ảnh.
 
 Thông báo mặc định bằng **tiếng Anh**, máy cài tiếng Việt thì tự chuyển sang tiếng Việt.
 Dùng `--lang vi` hoặc `--lang en` để tự chọn.
@@ -82,7 +98,7 @@ Chỉ cần khi tải **tài khoản riêng tư bạn đang theo dõi** hoặc *
    - `✗ Session ID không hợp lệ hoặc đã hết hạn` → copy lại cái mới.
 7. Tải kèm session:
    ```bash
-   python tiktok-dl.py @username --session-id DAN_SESSIONID_VAO_DAY
+   python tiktok-dl.py username --session-id DAN_SESSIONID_VAO_DAY
    ```
    Tool sẽ tự kiểm tra session trước, nếu không hợp lệ thì dừng lại.
 

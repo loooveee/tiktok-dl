@@ -643,6 +643,7 @@ class Progress:
         self.db.commit()
 
     def done(self, post_id: str, folder: Path) -> bool:
+        """True when the post finished in an earlier run and its main file still exists."""
         row = self.db.execute("SELECT status, file FROM posts WHERE id = ?", (post_id,)).fetchone()
         return bool(row and row[0] == "done" and row[1] and (folder / row[1]).exists())
 
@@ -947,6 +948,17 @@ def save_profile(tt: TikTok, username: str, out_dir: Path) -> Optional[dict]:
     return info
 
 
+def missing_photos(out_dir: Path, post_id: str) -> bool:
+    """True for a photo post saved earlier as a slideshow only (before images were saved by default)."""
+    try:
+        item = json.loads((out_dir / "metadata" / f"{post_id}.json").read_text(encoding="utf-8"))["raw"]
+    except (OSError, ValueError, KeyError):
+        return False
+    if not (item.get("imagePost") or {}).get("images"):
+        return False
+    return not (out_dir / f"{base_name(item)}_01.jpg").exists()
+
+
 def write_csv(out_dir: Path) -> int:
     rows = []
     for f in sorted((out_dir / "metadata").glob("*.json")):
@@ -990,13 +1002,14 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
         finally:
             status("")
         found = bold(len(entries))
-        log(gray(t("  Found ", "  Tìm thấy ")) + found + gray(t(" posts.", " bài đăng.")))
+        log(gray(t("  Found ", "  Tìm thấy ")) + found + gray(t(" post." if len(entries) == 1 else " posts.", " bài đăng.")))
 
     progress = Progress(out_dir / ".progress.db")
     if opts.metadata_only:
         pending = [e for e in entries if not (out_dir / "metadata" / f"{e['id']}.json").exists()]
     else:
-        pending = [e for e in entries if not progress.done(str(e["id"]), out_dir)]
+        pending = [e for e in entries if not progress.done(str(e["id"]), out_dir)
+                   or (opts.keep_images and missing_photos(out_dir, str(e["id"])))]
     if len(pending) < len(entries):
         skipped = len(entries) - len(pending)
         log(gray(t(f"  Skipping {skipped} posts already downloaded.", f"  Bỏ qua {skipped} bài đã có.")))
@@ -1049,7 +1062,14 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             fail(post.url, str(e))
             return
         progress.mark(post.id, "done", file=name)
-        kind = magenta("[slideshow] ") if post.is_slide else ""
+        kind = ""
+        if post.is_slide:
+            # Count the saved images in the output folder (the temporary .parts copies are gone by now).
+            photos = sum(1 for i in range(1, len(post.images) + 1) if (out_dir / f"{post.base}_{i:02d}.jpg").exists())
+            label = "slideshow" if name.endswith(".mp4") else ""
+            if photos:
+                label = (label + " + " if label else "") + f"{photos} {t('images', 'ảnh')}"
+            kind = magenta(f"[{label}] ")
         extra = f"  {yellow('(' + note + ')')}" if note else ""
         succeed(f"{kind}{name}  {gray(fmt_bytes(size))}{extra}", size)
 
@@ -1166,10 +1186,13 @@ def main() -> None:
         description=t("Download every video from a TikTok profile (aria2c + ffmpeg, with full metadata).",
                       "Tải toàn bộ video của profile TikTok (aria2c + ffmpeg, kèm đầy đủ metadata)."),
         epilog=t("Examples:", "Ví dụ:")
-               + "\n  python tiktok-dl.py @tiktok\n  python tiktok-dl.py tiktok -n 20 -j 16\n"
+               + "\n  python tiktok-dl.py tiktok\n  python tiktok-dl.py .some.user -n 20\n"
+               "  python tiktok-dl.py https://www.tiktok.com/@tiktok\n"
                "  python tiktok-dl.py https://www.tiktok.com/@tiktok/video/7704834703446117662\n"
                "  python tiktok-dl.py https://vt.tiktok.com/XXXXXXXXX/\n"
-               "  python tiktok-dl.py @tiktok --lang vi\n\n"
+               "  python tiktok-dl.py tiktok --lang vi\n\n"
+               + t("In PowerShell, write usernames without @ or put them in quotes: '@tiktok'.\n",
+                   "Trong PowerShell, gõ username không có @ hoặc đặt trong dấu nháy: '@tiktok'.\n")
                + t("Put aria2c.exe and ffmpeg.exe next to tiktok-dl.py (or in PATH).",
                    "Đặt aria2c.exe và ffmpeg.exe cạnh tiktok-dl.py (hoặc trong PATH)."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1206,9 +1229,11 @@ def main() -> None:
     p.add_argument("--no-slideshow", dest="slideshow", action="store_false",
                    help=t("photo posts: save images + music only, no slideshow video",
                           "bài ảnh: không dựng video slideshow, chỉ lưu ảnh + nhạc"))
-    p.add_argument("--keep-images", action="store_true",
-                   help=t("photo posts: also save each JPG + MP3 next to the slideshow",
-                          "bài ảnh: lưu thêm từng ảnh JPG + MP3 cạnh slideshow"))
+    p.add_argument("--no-images", dest="keep_images", action="store_false",
+                   help=t("photo posts: only save the slideshow video, not each JPG + MP3",
+                          "bài ảnh: chỉ lưu video slideshow, không lưu từng ảnh JPG + MP3"))
+    # Kept so old commands still work: saving images is now the default.
+    p.add_argument("--keep-images", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--slide-seconds", type=float, default=3.0,
                    help=t("seconds per image in slideshows (default: 3)",
                           "số giây mỗi ảnh trong slideshow (mặc định: 3)"))

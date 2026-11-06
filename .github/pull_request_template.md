@@ -8,7 +8,7 @@
 
 ## How did you test it?
 
-- [ ] `python tiktok-dl.py @tiktok -n 5`
+- [ ] `python tiktok-dl.py tiktok -n 5`
 - [ ] A photo post (slideshow)
 - [ ] `--lang vi`
 - [ ] Ran the same command twice (finished posts are skipped)

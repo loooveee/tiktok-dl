@@ -54,10 +54,10 @@ download works and has a code map. In short:
 There are no automated tests yet. Before opening a pull request, run at least:
 
 ```bash
-python tiktok-dl.py @tiktok -n 5                 # normal videos
+python tiktok-dl.py tiktok -n 5                 # normal videos
 python tiktok-dl.py <link to a photo post>       # photo slideshow
-python tiktok-dl.py @tiktok -n 5 --lang vi       # Vietnamese messages
-python tiktok-dl.py @tiktok -n 5 --no-color      # plain output
+python tiktok-dl.py tiktok -n 5 --lang vi       # Vietnamese messages
+python tiktok-dl.py tiktok -n 5 --no-color      # plain output
 ```
 
 Then run the first command again: it should skip the posts it already downloaded.

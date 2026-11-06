@@ -9,7 +9,7 @@ Download every video from a TikTok profile, with full metadata.
 
 - Fast downloads with **aria2c**
 - **ffmpeg** adds title, author, date, description, stats, cover and subtitles to each MP4
-- Photo posts are turned into MP4 slideshows
+- Photo posts are saved as an MP4 slideshow **and** as separate images (+ music)
 - Saves all info to `videos.csv` and `metadata/*.json`
 - Stop anytime, run again to continue
 
@@ -27,20 +27,36 @@ Download every video from a TikTok profile, with full metadata.
 ## Use
 
 ```bash
-python tiktok-dl.py @username
+python tiktok-dl.py username
 ```
 
 | Command | What it does |
 |---|---|
-| `python tiktok-dl.py @username` | Download the whole profile |
-| `python tiktok-dl.py @username -n 20` | Only the 20 newest posts |
-| `python tiktok-dl.py @username -o D:\TikTok` | Save to another folder |
-| `python tiktok-dl.py @username --metadata-only` | Only save info, no videos |
+| `python tiktok-dl.py username` | Download the whole profile |
+| `python tiktok-dl.py username -n 20` | Only the 20 newest posts |
+| `python tiktok-dl.py username -o D:\TikTok` | Save to another folder |
+| `python tiktok-dl.py username --metadata-only` | Only save info, no videos |
 | `python tiktok-dl.py <video link>` | Download one video |
 | `python tiktok-dl.py https://vt.tiktok.com/XXXXXXXXX/` | Short links from the TikTok app work too |
-| `python tiktok-dl.py @username --lang vi` | Show messages in Vietnamese |
+| `python tiktok-dl.py username --lang vi` | Show messages in Vietnamese |
+| `python tiktok-dl.py username --no-images` | Photo posts: slideshow video only |
+
+**Ways to enter a profile** (all do the same thing):
+
+```bash
+python tiktok-dl.py .aaapaathy
+python tiktok-dl.py https://www.tiktok.com/@.aaapaathy
+python tiktok-dl.py "@.aaapaathy"
+```
+
+> [!NOTE]
+> In **PowerShell**, `@` has a special meaning. Type the username without `@`, or put it in quotes.
 
 Files are saved in `downloads/<username>/`.
+
+**Photo posts** are saved three ways: an MP4 slideshow with the music, every image as a JPG
+(`..._01.jpg`, `..._02.jpg`, ...) and the music as an MP3. Use `--no-images` for the slideshow only,
+or `--no-slideshow` for the images only.
 
 Messages are in **English** by default (Vietnamese if your system language is Vietnamese).
 Use `--lang en` or `--lang vi` to choose.
@@ -82,7 +98,7 @@ You only need this for **private accounts you follow** or **age-restricted posts
    - `✗ Session ID is invalid or expired` → copy a new one.
 7. Download with it:
    ```bash
-   python tiktok-dl.py @username --session-id PASTE_YOUR_SESSIONID_HERE
+   python tiktok-dl.py username --session-id PASTE_YOUR_SESSIONID_HERE
    ```
    The tool checks the session first and stops if it is not valid.
 
