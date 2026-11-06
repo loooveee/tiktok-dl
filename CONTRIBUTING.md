@@ -79,6 +79,6 @@ Then run the first command again: it should skip the posts it already downloaded
    ```bash
    git push -u origin fix-short-links
    ```
-5. On GitHub, click **Compare & pull request** and fill in the template.
+5. On GitHub, click **Compare & pull request** and describe what you changed, why, and how you tested it.
 
 Keep one topic per pull request. Small pull requests get reviewed faster.
