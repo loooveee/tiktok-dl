@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+downloads/
+aria2c.exe
+ffmpeg.exe
