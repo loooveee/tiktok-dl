@@ -740,17 +740,26 @@ def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
 
 def mux_slideshow(ffmpeg: str, post: Post, out: Path, seconds: float) -> None:
     images = [p for p in post.images if p.exists() and p.stat().st_size]
-    lst = post.work / "slides.txt"
-    body = "".join(f"file '{p.as_posix()}'\nduration {seconds}\n" for p in images)
-    lst.write_text(body + f"file '{images[-1].as_posix()}'\n", encoding="utf-8")
-    vf = ("scale=1080:1920:force_original_aspect_ratio=decrease:out_range=tv,"
-          "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p")
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+    # Mỗi ảnh là một input riêng (lặp trong `seconds` giây), được đưa về khung 1080x1920 trước rồi mới nối.
+    # Không dùng concat demuxer: ảnh trong một bài thường lệch kích thước vài pixel, ffmpeg phải dựng lại
+    # bộ lọc giữa chừng và làm mất các khung hình đầu (video bắt đầu trễ vài giây).
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in images:
+        cmd += ["-loop", "1", "-framerate", "30", "-t", str(seconds), "-i", str(p.resolve())]
     audio = post.audio if post.audio and post.audio.exists() and post.audio.stat().st_size else None
     if audio:
-        cmd += ["-stream_loop", "-1", "-i", str(audio)]
-    cmd += ["-map", "0:v"] + (["-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"] if audio else [])
-    cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        cmd += ["-stream_loop", "-1", "-i", str(audio.resolve())]
+    chains = [
+        f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease:out_range=tv,"
+        f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,fps=30[v{i}]"
+        for i in range(len(images))
+    ]
+    joined = "".join(f"[v{i}]" for i in range(len(images)))
+    graph = ";".join(chains) + f";{joined}concat=n={len(images)}:v=1:a=0[v]"
+    cmd += ["-filter_complex", graph, "-map", "[v]"]
+    if audio:
+        cmd += ["-map", f"{len(images)}:a", "-c:a", "aac", "-b:a", "192k"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", "30",
             "-t", str(seconds * len(images))]
     cmd += tag_args(mux_tags(post.item)) + ["-movflags", "+faststart", str(out)]
     ok, err = run_ffmpeg(cmd)
@@ -851,7 +860,7 @@ def write_csv(out_dir: Path) -> int:
 
 def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str]) -> int:
     username, single = parse_target(target)
-    out_dir = Path(opts.output) / username
+    out_dir = Path(opts.output).resolve() / username
     (out_dir / "metadata").mkdir(parents=True, exist_ok=True)
     work = out_dir / ".parts"
     work.mkdir(exist_ok=True)
@@ -975,6 +984,8 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
 
                 tasks = [t for p in posts for t in p.tasks]
                 bar.downloading(tasks)
+                # File đã tải xong từ lần chạy trước không được tính vào tốc độ.
+                already = sum(d.stat().st_size for _, d, _ in tasks if is_valid_file(d))
                 t0 = time.monotonic()
                 try:
                     if aria2:
@@ -989,7 +1000,8 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                     bar.downloaded()
                 with tally_lock:
                     tally["dl_secs"] += time.monotonic() - t0
-                    tally["dl_bytes"] += sum(d.stat().st_size for _, d, _ in tasks if d.exists())
+                    after = sum(d.stat().st_size for _, d, _ in tasks if d.exists())
+                    tally["dl_bytes"] += max(0, after - already)
 
                 mux_futures += [mux_pool.submit(finish, post) for post in posts]
             for fut in mux_futures:
