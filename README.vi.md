@@ -58,7 +58,7 @@ Bài nào không tải được, tool sẽ báo cho bạn:
 - Toàn bộ bài lỗi được lưu vào file **`failed.txt`** trong thư mục tải, để bạn tự mở từng link ra kiểm tra.
 
 ```
-https://www.tiktok.com/@username/video/7705012484368780552
+https://www.tiktok.com/@username/video/1234567890123456789
     video quảng cáo / TikTok Shop: TikTok không cung cấp link tải qua web (kể cả khi đã đăng nhập)
 ```
 

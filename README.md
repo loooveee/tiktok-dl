@@ -58,7 +58,7 @@ If a post can't be downloaded, the tool tells you:
 - All failed posts are also saved to **`failed.txt`** in the output folder, so you can open each link and check it yourself.
 
 ```
-https://www.tiktok.com/@username/video/7705012484368780552
+https://www.tiktok.com/@username/video/1234567890123456789
     ad / TikTok Shop video: TikTok does not provide a download link on the web (even when logged in)
 ```
 
