@@ -45,6 +45,9 @@ File được lưu trong `downloads/<username>/`.
 Thông báo mặc định bằng **tiếng Anh**, máy cài tiếng Việt thì tự chuyển sang tiếng Việt.
 Dùng `--lang vi` hoặc `--lang en` để tự chọn.
 
+Chữ có màu (xanh lá = xong, đỏ = lỗi, vàng = lý do / cảnh báo) kèm thanh tiến độ chạy trực tiếp.
+Dùng `--no-color` (hoặc đặt biến `NO_COLOR=1`) để in chữ trơn.
+
 Chạy `python tiktok-dl.py -h` để xem tất cả tuỳ chọn.
 
 ## Log bài không tải được
@@ -94,6 +97,10 @@ Chỉ cần khi tải **tài khoản riêng tư bạn đang theo dõi** hoặc *
 - **Vài bài bị lỗi:** xem file `failed.txt` trong thư mục tải (có link và lý do từng bài), rồi chạy lại đúng lệnh cũ
 - **Video quảng cáo / TikTok Shop bị lỗi:** TikTok không cung cấp link tải cho loại video này qua web, kể cả khi đã đăng nhập. Chúng được liệt kê trong `failed.txt` để bạn tự mở xem
 - **Tài khoản riêng tư:** thêm `--session-id <cookie sessionid của bạn>`
+
+## Đóng góp
+
+Mọi báo lỗi và pull request đều được hoan nghênh. Xem [CONTRIBUTING.md](CONTRIBUTING.md) (tiếng Anh).
 
 ## Miễn trừ trách nhiệm
 

@@ -45,6 +45,9 @@ Files are saved in `downloads/<username>/`.
 Messages are in **English** by default (Vietnamese if your system language is Vietnamese).
 Use `--lang en` or `--lang vi` to choose.
 
+Output is colored (green = done, red = failed, yellow = reason / warning) with a live progress bar.
+Use `--no-color` (or set `NO_COLOR=1`) for plain text.
+
 Run `python tiktok-dl.py -h` to see all options.
 
 ## Failed downloads log
@@ -94,6 +97,10 @@ You only need this for **private accounts you follow** or **age-restricted posts
 - **Some posts failed:** see `failed.txt` in the output folder (link + reason for each post), then run the same command again
 - **Ad / TikTok Shop videos fail:** TikTok does not give a download link for these on the web, even when you are logged in. They are listed in `failed.txt` so you can open them yourself
 - **Private account:** add `--session-id <your sessionid cookie>`
+
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
