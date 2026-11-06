@@ -44,10 +44,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import requests
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
@@ -369,6 +370,7 @@ def resolve_short_link(text: str) -> str:
             loc = r.headers.get("Location")
             if not loc:
                 break
+            loc = urljoin(r.url, loc)   # Location may be relative
             if re.search(r"tiktok\.com/@[^/?#]+", loc):
                 return loc
             r = requests.get(loc, headers={"User-Agent": UA}, allow_redirects=False, timeout=20)
@@ -471,15 +473,28 @@ class TikTok:
             msg = t(*known) if known else t(f"TikTok returned statusCode {code} {raw}", f"TikTok trả statusCode {code} {raw}")
             raise ScrapeError(msg.strip(), code)
 
+    @staticmethod
+    def _dig(data: dict, *keys: str) -> dict:
+        """data[k1][k2]..., raising ScrapeError instead of KeyError when TikTok changes the page."""
+        for key in keys:
+            if not isinstance(data, dict) or key not in data:
+                raise ScrapeError(t(f"unexpected page data (missing '{key}')",
+                                    f"dữ liệu trang không như mong đợi (thiếu '{key}')"))
+            data = data[key]
+        return data
+
     def user(self, username: str) -> dict:
         data = self._scope(f"https://www.tiktok.com/@{username}", "webapp.user-detail")
         self._check(data)
-        return data["userInfo"]
+        return self._dig(data, "userInfo")
 
     def item(self, username: str, video_id: str) -> dict:
         data = self._scope(f"https://www.tiktok.com/@{username}/video/{video_id}", "webapp.video-detail")
         self._check(data)
-        return data["itemInfo"]["itemStruct"]
+        item = self._dig(data, "itemInfo", "itemStruct")
+        if not item.get("id"):
+            raise ScrapeError(t("post page has no post data", "trang bài đăng không có dữ liệu bài"))
+        return item
 
     def whoami(self) -> Optional[dict]:
         """The account logged in with the current cookies, or None when logged out.
@@ -496,7 +511,11 @@ class TikTok:
 
 def list_posts(username: str, limit: Optional[int], cookiefile: Optional[str]) -> list[dict]:
     """Every post of the profile, newest first (yt-dlp TikTokUser extractor)."""
-    import yt_dlp
+    try:
+        import yt_dlp
+    except ImportError:
+        raise ScrapeError(t("yt-dlp is not installed. Run: pip install -r requirements.txt",
+                            "chưa cài yt-dlp. Chạy: pip install -r requirements.txt"))
 
     class Quiet:
         def debug(self, msg):
@@ -525,12 +544,14 @@ def list_posts(username: str, limit: Optional[int], cookiefile: Optional[str]) -
     return [e for e in (info or {}).get("entries") or [] if e and e.get("id")]
 
 
-def write_cookie_file(session_id: str, folder: Path) -> str:
-    path = folder / "session-cookies.txt"
+def write_cookie_file(session_id: str) -> str:
+    """Netscape cookie file for yt-dlp in the system temp folder. The caller must delete it."""
     exp = int(time.time()) + 30 * 86400
     rows = [f".tiktok.com\tTRUE\t/\tTRUE\t{exp}\t{n}\t{session_id}" for n in ("sessionid", "sessionid_ss", "sid_tt")]
-    path.write_text("# Netscape HTTP Cookie File\n" + "\n".join(rows) + "\n", encoding="utf-8")
-    return str(path)
+    fd, path = tempfile.mkstemp(prefix="tiktok-dl-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("# Netscape HTTP Cookie File\n" + "\n".join(rows) + "\n")
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -556,8 +577,8 @@ def flatten(item: dict) -> dict:
         "author_id": author.get("id"),
         "author_verified": author.get("verified"),
         "description": item.get("desc"),
-        "hashtags": " ".join(f"#{t['hashtagName']}" for t in extra if t.get("hashtagName")),
-        "mentions": " ".join(f"@{t['userUniqueId']}" for t in extra if t.get("userUniqueId")),
+        "hashtags": " ".join(f"#{x['hashtagName']}" for x in extra if x.get("hashtagName")),
+        "mentions": " ".join(f"@{x['userUniqueId']}" for x in extra if x.get("userUniqueId")),
         "plays": to_int(stats.get("playCount")),
         "likes": to_int(stats.get("diggCount")),
         "comments": to_int(stats.get("commentCount")),
@@ -586,7 +607,8 @@ def flatten(item: dict) -> dict:
         "category_type": item.get("CategoryType"),
         "diversification_labels": " | ".join(item.get("diversificationLabels") or []) or None,
         "suggested_words": " | ".join(item.get("suggestedWords") or []) or None,
-        "sticker_texts": " | ".join(t for s in item.get("stickersOnItem") or [] for t in s.get("stickerText") or []) or None,
+        "sticker_texts": " | ".join(txt for s in item.get("stickersOnItem") or []
+                                    for txt in s.get("stickerText") or []) or None,
         "effects": " | ".join(e.get("name", "") for e in item.get("effectStickers") or []) or None,
         "duet_enabled": item.get("duetEnabled", False),
         "stitch_enabled": item.get("stitchEnabled", False),
@@ -652,6 +674,10 @@ class Progress:
             self.db.execute("INSERT OR REPLACE INTO posts VALUES (?, ?, ?, ?, ?)",
                             (post_id, state, file, error, datetime.now().isoformat(timespec="seconds")))
             self.db.commit()
+
+    def close(self) -> None:
+        with self.lock:
+            self.db.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -747,9 +773,12 @@ def download_aria2(aria2: str, tasks, cookie: str, jobs: int, conns: int, work: 
         dest.parent.mkdir(parents=True, exist_ok=True)
         for leftover in (dest, Path(f"{dest}.aria2")):
             leftover.unlink(missing_ok=True)
-        lines += [mirrors[attempt], f"  dir={dest.parent}", f"  out={dest.name}"]
+        # The cookie may hold the user's sessionid: keep it in the input file (deleted below),
+        # not on the command line where other programs can read it.
+        lines += [mirrors[attempt], f"  dir={dest.parent}", f"  out={dest.name}", f"  header=Cookie: {cookie}"]
     if not lines:
         return
+    work.mkdir(parents=True, exist_ok=True)
     inp = work / "aria2-input.txt"
     inp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     cmd = [
@@ -758,7 +787,7 @@ def download_aria2(aria2: str, tasks, cookie: str, jobs: int, conns: int, work: 
         "--continue=true", "--allow-overwrite=true", "--auto-file-renaming=false",
         "--file-allocation=none", "--max-tries=5", "--retry-wait=2", "--timeout=30",
         "--connect-timeout=15", "--quiet=true", f"--user-agent={UA}",
-        "--referer=https://www.tiktok.com/", f"--header=Cookie: {cookie}", "--header=Accept: */*",
+        "--referer=https://www.tiktok.com/", "--header=Accept: */*",
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -766,6 +795,8 @@ def download_aria2(aria2: str, tasks, cookie: str, jobs: int, conns: int, work: 
     except KeyboardInterrupt:
         proc.terminate()
         raise
+    finally:
+        inp.unlink(missing_ok=True)
 
 
 def download_requests(session: requests.Session, tasks, jobs: int) -> None:
@@ -798,7 +829,10 @@ def download_requests(session: requests.Session, tasks, jobs: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
-    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:   # ffmpeg missing or not executable
+        return False, str(e)
     return p.returncode == 0, p.stderr.decode("utf-8", "replace").strip()[-400:]
 
 
@@ -835,12 +869,21 @@ def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
         return cmd + tags + ["-movflags", "+faststart", str(out)]
 
     # If the cover (sometimes an odd HEIC/WebP) or a subtitle breaks ffmpeg, drop them one at a time.
-    notes = []
-    for with_cover, with_subs in ((True, True), (False, True), (False, False)):
+    attempts = [(True, True)]
+    if cover:
+        attempts.append((False, True))
+    if subs:
+        attempts.append((False, False))
+    err = ""
+    for with_cover, with_subs in attempts:
         ok, err = run_ffmpeg(build(with_cover, with_subs))
         if ok:
+            notes = []
+            if cover and not with_cover:
+                notes.append(t("cover skipped", "bỏ ảnh bìa"))
+            if subs and not with_subs:
+                notes.append(t("subtitles skipped", "bỏ phụ đề"))
             return ", ".join(notes)
-        notes.append(t("cover skipped", "bỏ ảnh bìa") if with_cover and cover else t("subtitles skipped", "bỏ phụ đề"))
     raise ScrapeError(t(f"ffmpeg error: {err}", f"ffmpeg lỗi: {err}"))
 
 
@@ -877,7 +920,8 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
     """Mux/move files of one post into out_dir. Returns (main file name, total bytes, note)."""
     when = created_at(post.item).timestamp()
     produced: list[Path] = []
-    note = ""
+
+    notes: list[str] = []
 
     if post.is_slide:
         images = [p for p in post.images if p.exists() and p.stat().st_size]
@@ -885,14 +929,19 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
             raise ScrapeError(t("no image could be downloaded", "không tải được ảnh nào"))
         if len(images) < len(post.images):
             missing = len(post.images) - len(images)
-            note = t(f"{missing} image(s) missing", f"thiếu {missing} ảnh")
+            notes.append(t(f"{missing} image(s) missing", f"thiếu {missing} ảnh"))
         main = None
         if ffmpeg and opts.slideshow:
             tmp = post.work / "slideshow.mp4"
-            mux_slideshow(ffmpeg, post, tmp, opts.slide_seconds)
-            main = out_dir / f"{post.base}.mp4"
-            os.replace(tmp, main)
-            produced.append(main)
+            try:
+                mux_slideshow(ffmpeg, post, tmp, opts.slide_seconds)
+                main = out_dir / f"{post.base}.mp4"
+                os.replace(tmp, main)
+                produced.append(main)
+            except ScrapeError as e:
+                notes.append(t("slideshow failed, images saved", "không dựng được slideshow, đã lưu ảnh"))
+                log(warn(f"{post.url}: {e}"))
+        # Images are saved when asked, and always when there is no slideshow (so nothing is lost).
         if opts.keep_images or not main:
             for i, p in enumerate(images, 1):
                 dest = out_dir / f"{post.base}_{i:02d}.jpg"
@@ -907,14 +956,25 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
         if not post.video.exists() or post.video.stat().st_size < 1024:
             raise ScrapeError(t("video could not be downloaded", "không tải được video"))
         main = out_dir / f"{post.base}.mp4"
+        muxed = False
         if ffmpeg:
             tmp = post.work / "muxed.mp4"
-            note = mux_video(ffmpeg, post, tmp)
-            os.replace(tmp, main)
+            try:
+                note = mux_video(ffmpeg, post, tmp)
+                os.replace(tmp, main)
+                muxed = True
+                if note:
+                    notes.append(note)
+            except ScrapeError as e:
+                # Keep the downloaded video even when ffmpeg fails.
+                notes.append(t("ffmpeg failed, saved without metadata", "ffmpeg lỗi, đã lưu video chưa gắn metadata"))
+                log(warn(f"{post.url}: {e}"))
         else:
+            notes.append(t("no ffmpeg, metadata not added", "không có ffmpeg, chưa gắn metadata"))
+        if not muxed:
             shutil.copyfile(post.video, main)
-            note = t("no ffmpeg, metadata not added", "không có ffmpeg, chưa gắn metadata")
         produced.append(main)
+    note = ", ".join(notes)
 
     for p in produced:
         os.utime(p, (when, when))
@@ -979,8 +1039,7 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     username, single = parse_target(target)
     out_dir = Path(opts.output).resolve() / username
     (out_dir / "metadata").mkdir(parents=True, exist_ok=True)
-    work = out_dir / ".parts"
-    work.mkdir(exist_ok=True)
+    work = out_dir / ".parts"   # temporary files, created only when something is downloaded
     tt = TikTok(opts.session_id, opts.wait, opts.proxy)
 
     log("\n" + bold_cyan(f"━━ @{username} ") + gray("━" * max(4, 40 - len(username))))
@@ -996,13 +1055,19 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     if single:
         entries = [{"id": single}]
     else:
-        cookiefile = write_cookie_file(opts.session_id, work) if opts.session_id else None
+        cookiefile = write_cookie_file(opts.session_id) if opts.session_id else None
         try:
             entries = list_posts(username, opts.limit, cookiefile)
         finally:
             status("")
+            if cookiefile:
+                Path(cookiefile).unlink(missing_ok=True)
         found = bold(len(entries))
         log(gray(t("  Found ", "  Tìm thấy ")) + found + gray(t(" post." if len(entries) == 1 else " posts.", " bài đăng.")))
+        if not entries:
+            log(warn(t("No posts found. The account may be private, empty, or TikTok blocked the list for now.",
+                       "Không tìm thấy bài nào. Tài khoản có thể riêng tư, chưa có bài, hoặc TikTok tạm chặn.")))
+            return 1
 
     progress = Progress(out_dir / ".progress.db")
     if opts.metadata_only:
@@ -1016,6 +1081,7 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
 
     n = len(pending)
     if not n:
+        progress.close()
         log(green(t("  ✓ Nothing left to download.", "  ✓ Không còn bài nào cần tải.")))
         write_csv(out_dir)
         return 0
@@ -1049,6 +1115,8 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             return entry, tt.item(username, str(entry["id"])), None
         except ScrapeError as e:
             return entry, None, str(e)
+        except Exception as e:   # never let one post stop the whole run
+            return entry, None, f"{type(e).__name__}: {e}"
 
     def fetch_batch(batch):
         with ThreadPoolExecutor(opts.workers) as pool:
@@ -1057,9 +1125,10 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     def finish(post: Post) -> None:
         try:
             name, size, note = finalize(post, out_dir, ffmpeg, opts)
-        except (ScrapeError, OSError) as e:
-            progress.mark(post.id, "error", error=str(e))
-            fail(post.url, str(e))
+        except Exception as e:   # never let one post stop the whole run
+            reason = str(e) if isinstance(e, (ScrapeError, OSError)) else f"{type(e).__name__}: {e}"
+            progress.mark(post.id, "error", error=reason)
+            fail(post.url, reason)
             return
         progress.mark(post.id, "done", file=name)
         kind = ""
@@ -1102,7 +1171,13 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                         progress.mark(pid, "metadata")
                         succeed(f"{gray('metadata')} {pid}")
                         continue
-                    post = Post(item, work, opts)
+                    try:
+                        post = Post(item, work, opts)
+                    except Exception as e:   # malformed post data
+                        reason = f"{type(e).__name__}: {e}"
+                        progress.mark(pid, "error", error=reason)
+                        fail(post_url(pid), reason)
+                        continue
                     if post.hidden:
                         progress.mark(pid, "error", error=post.hidden)
                         fail(post.url, post.hidden)
@@ -1111,14 +1186,14 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                 if not posts:
                     continue
 
-                tasks = [t for p in posts for t in p.tasks]
+                tasks = [task for p in posts for task in p.tasks]
                 bar.downloading(tasks)
                 # Files finished in an earlier run do not count towards the speed.
                 already = sum(d.stat().st_size for _, d, _ in tasks if is_valid_file(d))
                 t0 = time.monotonic()
                 try:
                     if aria2:
-                        for attempt in range(max((len(t[0]) for t in tasks), default=0)):
+                        for attempt in range(max((len(mirrors) for mirrors, _, _ in tasks), default=0)):
                             download_aria2(aria2, tasks, cookie, opts.jobs, opts.connections, work, attempt)
                         for _, dest, _ in tasks:
                             if not is_valid_file(dest):
@@ -1137,7 +1212,9 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                 fut.result()
         finally:
             meta_pool.shutdown(wait=False, cancel_futures=True)
-            mux_pool.shutdown(wait=True)
+            # Finish the mux jobs already running; drop queued ones if we are stopping on an error.
+            mux_pool.shutdown(wait=True, cancel_futures=sys.exc_info()[0] is not None)
+            progress.close()
 
     ok, failed, total_bytes = tally["ok"], tally["failed"], tally["bytes"]
     rows = write_csv(out_dir)
@@ -1157,7 +1234,8 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
 
     secs = max(1.0, time.monotonic() - started)
     dot = gray(" · ")
-    speed = (f"{dot}aria2c {cyan(fmt_bytes(tally['dl_bytes'] / tally['dl_secs']) + '/s')}"
+    downloader = "aria2c" if aria2 else "requests"
+    speed = (f"{dot}{downloader} {cyan(fmt_bytes(tally['dl_bytes'] / tally['dl_secs']) + '/s')}"
              if tally["dl_secs"] > 0 else "")
     title = t(f"Done @{username} ", f"Xong @{username} ")
     log("\n" + bold(f"  ━━ {title}") + gray("━" * max(4, 36 - len(title))))
@@ -1261,6 +1339,11 @@ def main() -> None:
     opts.connections = max(1, min(16, opts.connections))
     opts.workers = max(1, min(16, opts.workers))
     opts.batch = max(1, opts.batch)
+    opts.mux_jobs = max(1, opts.mux_jobs)
+    if opts.limit is not None and opts.limit < 1:
+        p.error(t("-n/--limit must be 1 or more", "-n/--limit phải từ 1 trở lên"))
+    if opts.slide_seconds < 0.5:
+        p.error(t("--slide-seconds must be at least 0.5", "--slide-seconds phải từ 0.5 trở lên"))
     if opts.check_session and not opts.session_id:
         p.error(t("--check-session needs --session-id <sessionid>",
                   "--check-session cần đi kèm --session-id <sessionid>"))
