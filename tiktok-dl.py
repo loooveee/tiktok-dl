@@ -42,6 +42,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -92,6 +93,8 @@ STATUS_MESSAGES = {
     10223: ("account is restricted", "tài khoản bị hạn chế"),
 }
 FATAL_PROFILE_CODES = {10202, 10221, 10222, 10223}
+# Post errors that no re-run can fix: the post is marked "skipped" and not fetched again (see --retry-all).
+PERMANENT_POST_CODES = {10204}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -337,6 +340,25 @@ class ScrapeError(Exception):
         self.code = code
 
 
+class RateLimited(ScrapeError):
+    """TikTok answered too many page reads in a row with HTTP 429/403: stop the whole run."""
+
+
+class Challenged(ScrapeError):
+    """TikTok answered a page read with its bot-protection challenge page instead of the page."""
+
+
+class ChallengeStop(RateLimited):
+    """Too many page reads in a row got the challenge page: stop the whole run like RateLimited."""
+
+
+def challenge_message() -> str:
+    return t("TikTok's bot protection blocked the request (challenge page). Try again later or from another "
+             "network (VPN off, a different connection); --session-id doesn't help with this.",
+             "Lớp chống bot của TikTok đã chặn request (trang xác minh). Hãy thử lại sau hoặc dùng mạng khác "
+             "(tắt VPN, đổi kết nối); --session-id không giúp được trường hợp này.")
+
+
 def find_tool(name: str) -> Optional[str]:
     """Prefer an executable next to tiktok-dl.py (e.g. aria2c.exe, ffmpeg.exe), then PATH."""
     for cand in (SCRIPT_DIR / f"{name}.exe", SCRIPT_DIR / name):
@@ -370,10 +392,10 @@ def resolve_short_link(text: str) -> str:
             loc = r.headers.get("Location")
             if not loc:
                 break
-            loc = urljoin(r.url, loc)   # Location may be relative
-            if re.search(r"tiktok\.com/@[^/?#]+", loc):
-                return loc
-            r = requests.get(loc, headers={"User-Agent": UA}, allow_redirects=False, timeout=20)
+            url = urljoin(url, loc)   # Location may be relative to the current URL
+            if re.search(r"tiktok\.com/@[^/?#]+", url):
+                return url
+            r = requests.get(url, headers={"User-Agent": UA}, allow_redirects=False, timeout=20)
     except requests.RequestException as e:
         raise ScrapeError(t(f"could not open short link {text} ({e})", f"không mở được link rút gọn {text} ({e})"))
     raise ScrapeError(t(f"short link does not lead to a TikTok post or profile: {text}",
@@ -421,6 +443,54 @@ def uniq(seq) -> list:
 # TikTok web client
 # --------------------------------------------------------------------------- #
 
+# Page reads answered with HTTP 429 (or 403) back off: wait as long as Retry-After says when
+# TikTok sends it, otherwise BACKOFF_BASE seconds, doubled on each retry (5, 10, 20 s).
+# Both are capped at BACKOFF_MAX, which limits one pause, not the run. The run stops after
+# RATE_LIMIT_STREAK rate-limited answers in a row (any thread, no other answer between), so a
+# blocked IP fails fast instead of retrying every post for hours.
+RATE_LIMIT_CODES = (403, 429)
+BACKOFF_BASE = 5.0
+BACKOFF_MAX = 120.0
+RATE_LIMIT_STREAK = 8
+
+
+def retry_after_seconds(value: Optional[str], now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds to wait from a Retry-After header (a number of seconds or an HTTP date), or None."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - (now or datetime.now(timezone.utc))).total_seconds())
+
+
+def backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Seconds to pause page reads after the attempt-th (0-based) rate-limited response."""
+    delay = retry_after if retry_after is not None else BACKOFF_BASE * 2 ** attempt
+    return min(BACKOFF_MAX, delay)
+
+
+# TikTok's bot protection (WAF) may answer a page read with a small (~1.4 KB) "Please wait..." page
+# that runs a challenge script (waf-aiso) instead of the real page. We only detect it, never solve it.
+# It does not clear within seconds, so it is not retried; CHALLENGE_STREAK such answers in a row stop
+# the run.
+CHALLENGE_MARKERS = ("_wafchallengeid", "waf-aiso")
+CHALLENGE_STREAK = 3
+
+
+def is_challenge_page(html: str) -> bool:
+    """True for TikTok's bot-protection challenge page (challenge markers, no embedded page data)."""
+    return any(m in html for m in CHALLENGE_MARKERS) and not REHYDRATION_RE.search(html)
+
+
 class TikTok:
     def __init__(self, session_id: Optional[str] = None, wait: float = 0.3, proxy: Optional[str] = None):
         self.s = requests.Session()
@@ -439,29 +509,101 @@ class TikTok:
         self.wait = wait
         self._lock = threading.Lock()
         self._last = 0.0
+        # Backoff after HTTP 429/403, shared by all metadata threads.
+        self._backoff_lock = threading.Lock()
+        self._pause_until = 0.0
+        self._warned = False
+        self._streak = 0          # rate-limited answers in a row
+        self._stopped = False     # set when the streak is too long or the run is stopping
+        self._challenges = 0      # challenge-page answers in a row
+        self._challenge_stop = False  # stopped because of the challenge page
+
+    def stop(self) -> None:
+        """Make queued and waiting page reads give up at once (run aborted or interrupted)."""
+        self._stopped = True
+
+    def _check_stopped(self) -> None:
+        if self._stopped:
+            if self._challenge_stop:
+                raise ChallengeStop(challenge_message())
+            raise RateLimited(t("stopped, TikTok keeps limiting requests",
+                                "đã dừng, TikTok liên tục giới hạn request"))
 
     def _throttle(self) -> None:
         with self._lock:
-            delay = self._last + self.wait - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
+            # Keep the --wait gap between requests and honour any backoff pause. Check again
+            # after sleeping, as another thread may have extended the pause meanwhile. Sleep in
+            # short slices so a stopped run does not sit out a long pause.
+            while True:
+                self._check_stopped()
+                delay = max(self._last + self.wait, self._pause_until) - time.monotonic()
+                if delay <= 0:
+                    break
+                time.sleep(min(delay, 1.0))
             self._last = time.monotonic()
+
+    def _rate_limited(self, r: requests.Response, attempt: int, retry: bool) -> None:
+        """Count a 429/403 answer: stop the run after too many in a row, else pause if retrying."""
+        with self._backoff_lock:
+            self._streak += 1
+            self._challenges = 0
+            if self._streak >= RATE_LIMIT_STREAK:
+                self._stopped = True
+        self._check_stopped()
+        if retry:
+            self._back_off(r, attempt)
+
+    def _challenged(self) -> None:
+        """Count a challenge-page answer and raise at once: no retry, no backoff pause."""
+        with self._backoff_lock:
+            self._streak = 0
+            self._challenges += 1
+            if self._challenges >= CHALLENGE_STREAK and not self._stopped:
+                self._stopped = self._challenge_stop = True
+        self._check_stopped()
+        raise Challenged(challenge_message())
+
+    def _back_off(self, r: requests.Response, attempt: int) -> None:
+        """Pause every page read after a rate-limited response; warn the user the first time."""
+        delay = backoff_delay(attempt, retry_after_seconds(r.headers.get("Retry-After")))
+        with self._backoff_lock:
+            self._pause_until = max(self._pause_until, time.monotonic() + delay)
+            first, self._warned = not self._warned, True
+        if first:
+            code = r.status_code
+            log(warn(t(f"TikTok is limiting requests (HTTP {code}). Slowing down and retrying; "
+                       "if it keeps happening, use a larger --wait or fewer --workers.",
+                       f"TikTok đang giới hạn request (HTTP {code}). Tool sẽ chậm lại rồi thử lại; "
+                       "nếu vẫn bị, hãy tăng --wait hoặc giảm --workers.")))
 
     def _scope(self, url: str, scope: str) -> dict:
         last = t("no response", "không có phản hồi")
-        for attempt in range(4):
+        attempts = 4
+        for attempt in range(attempts):
             self._throttle()
             try:
                 r = self.s.get(url, timeout=25)
+                if is_challenge_page(r.text):
+                    self._challenged()  # raises: retrying within seconds won't get past it
+                if r.status_code in RATE_LIMIT_CODES:
+                    # No pause after the last attempt: nothing retries it.
+                    self._rate_limited(r, attempt, retry=attempt + 1 < attempts)
+                    last = t(f"HTTP {r.status_code}, TikTok is limiting requests",
+                             f"HTTP {r.status_code}, TikTok đang giới hạn request")
+                    continue  # the backoff pause replaces the fixed retry delay below
+                with self._backoff_lock:
+                    self._streak = 0
+                    self._challenges = 0
                 m = REHYDRATION_RE.search(r.text)
                 if m:
                     data = json.loads(m.group(1)).get("__DEFAULT_SCOPE__", {}).get(scope)
-                    if data is not None:
+                    if isinstance(data, dict):
                         return data
                 last = t(f"HTTP {r.status_code}, page has no data", f"HTTP {r.status_code}, trang không có dữ liệu")
-            except (requests.RequestException, ValueError) as e:
+            except (requests.RequestException, ValueError, AttributeError) as e:
                 last = str(e)
-            time.sleep(1 + 2 * attempt)
+            if attempt + 1 >= attempts or STOP.wait(1 + 2 * attempt):   # no wait after the last attempt
+                break
         raise ScrapeError(last)
 
     @staticmethod
@@ -473,27 +615,23 @@ class TikTok:
             msg = t(*known) if known else t(f"TikTok returned statusCode {code} {raw}", f"TikTok trả statusCode {code} {raw}")
             raise ScrapeError(msg.strip(), code)
 
-    @staticmethod
-    def _dig(data: dict, *keys: str) -> dict:
-        """data[k1][k2]..., raising ScrapeError instead of KeyError when TikTok changes the page."""
-        for key in keys:
-            if not isinstance(data, dict) or key not in data:
-                raise ScrapeError(t(f"unexpected page data (missing '{key}')",
-                                    f"dữ liệu trang không như mong đợi (thiếu '{key}')"))
-            data = data[key]
-        return data
-
     def user(self, username: str) -> dict:
         data = self._scope(f"https://www.tiktok.com/@{username}", "webapp.user-detail")
         self._check(data)
-        return self._dig(data, "userInfo")
+        info = data.get("userInfo")
+        if not isinstance(info, dict):
+            raise ScrapeError(t("unexpected page format (no userInfo)",
+                                "trang có định dạng không như dự kiến (thiếu userInfo)"))
+        return info
 
     def item(self, username: str, video_id: str) -> dict:
         data = self._scope(f"https://www.tiktok.com/@{username}/video/{video_id}", "webapp.video-detail")
         self._check(data)
-        item = self._dig(data, "itemInfo", "itemStruct")
-        if not item.get("id"):
-            raise ScrapeError(t("post page has no post data", "trang bài đăng không có dữ liệu bài"))
+        info = data.get("itemInfo")
+        item = info.get("itemStruct") if isinstance(info, dict) else None
+        if not isinstance(item, dict) or not item.get("id"):
+            raise ScrapeError(t("unexpected page format (no itemInfo.itemStruct)",
+                                "trang có định dạng không như dự kiến (thiếu itemInfo.itemStruct)"))
         return item
 
     def whoami(self) -> Optional[dict]:
@@ -554,6 +692,25 @@ def write_cookie_file(session_id: str) -> str:
     return path
 
 
+def list_posts_with_session(username: str, limit: Optional[int], session_id: Optional[str]) -> list[dict]:
+    """list_posts() with the user's session. The cookie file holds the session ID, so it lives in the
+    system temp folder and is deleted as soon as the list is fetched, even on errors or Ctrl+C."""
+    if not session_id:
+        return list_posts(username, limit, None)
+    cookiefile = write_cookie_file(session_id)
+    try:
+        return list_posts(username, limit, cookiefile)
+    finally:
+        Path(cookiefile).unlink(missing_ok=True)
+
+
+def resolve_session_id(flag: Optional[str], environ=None) -> Optional[str]:
+    """The session ID from --session-id, else from the TIKTOK_SESSIONID environment variable
+    (which keeps it out of shell history). The flag wins when both are set."""
+    environ = os.environ if environ is None else environ
+    return (flag or "").strip() or (environ.get("TIKTOK_SESSIONID") or "").strip() or None
+
+
 # --------------------------------------------------------------------------- #
 # Metadata
 # --------------------------------------------------------------------------- #
@@ -577,8 +734,8 @@ def flatten(item: dict) -> dict:
         "author_id": author.get("id"),
         "author_verified": author.get("verified"),
         "description": item.get("desc"),
-        "hashtags": " ".join(f"#{x['hashtagName']}" for x in extra if x.get("hashtagName")),
-        "mentions": " ".join(f"@{x['userUniqueId']}" for x in extra if x.get("userUniqueId")),
+        "hashtags": " ".join(f"#{tag['hashtagName']}" for tag in extra if tag.get("hashtagName")),
+        "mentions": " ".join(f"@{tag['userUniqueId']}" for tag in extra if tag.get("userUniqueId")),
         "plays": to_int(stats.get("playCount")),
         "likes": to_int(stats.get("diggCount")),
         "comments": to_int(stats.get("commentCount")),
@@ -607,8 +764,8 @@ def flatten(item: dict) -> dict:
         "category_type": item.get("CategoryType"),
         "diversification_labels": " | ".join(item.get("diversificationLabels") or []) or None,
         "suggested_words": " | ".join(item.get("suggestedWords") or []) or None,
-        "sticker_texts": " | ".join(txt for s in item.get("stickersOnItem") or []
-                                    for txt in s.get("stickerText") or []) or None,
+        "sticker_texts": " | ".join(text for s in item.get("stickersOnItem") or []
+                                    for text in s.get("stickerText") or []) or None,
         "effects": " | ".join(e.get("name", "") for e in item.get("effectStickers") or []) or None,
         "duet_enabled": item.get("duetEnabled", False),
         "stitch_enabled": item.get("stitchEnabled", False),
@@ -661,7 +818,10 @@ class Progress:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.lock = threading.Lock()
         self.db.execute("CREATE TABLE IF NOT EXISTS posts (id TEXT PRIMARY KEY, status TEXT, "
-                        "file TEXT, error TEXT, updated TEXT)")
+                        "file TEXT, error TEXT, updated TEXT, url TEXT)")
+        # Databases from older versions have no url column.
+        if "url" not in [col[1] for col in self.db.execute("PRAGMA table_info(posts)")]:
+            self.db.execute("ALTER TABLE posts ADD COLUMN url TEXT")
         self.db.commit()
 
     def done(self, post_id: str, folder: Path) -> bool:
@@ -669,11 +829,24 @@ class Progress:
         row = self.db.execute("SELECT status, file FROM posts WHERE id = ?", (post_id,)).fetchone()
         return bool(row and row[0] == "done" and row[1] and (folder / row[1]).exists())
 
-    def mark(self, post_id: str, state: str, file: Optional[str] = None, error: Optional[str] = None) -> None:
+    def mark(self, post_id: str, state: str, file: Optional[str] = None, error: Optional[str] = None,
+             url: Optional[str] = None) -> None:
         with self.lock:
-            self.db.execute("INSERT OR REPLACE INTO posts VALUES (?, ?, ?, ?, ?)",
-                            (post_id, state, file, error, datetime.now().isoformat(timespec="seconds")))
+            self.db.execute("INSERT OR REPLACE INTO posts (id, status, file, error, updated, url) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (post_id, state, file, error, datetime.now().isoformat(timespec="seconds"), url))
             self.db.commit()
+
+    def skipped(self) -> set[str]:
+        """Ids of posts that can never be downloaded (deleted, ad / TikTok Shop)."""
+        with self.lock:
+            return {row[0] for row in self.db.execute("SELECT id FROM posts WHERE status = 'skipped'")}
+
+    def failures(self) -> list[tuple[str, Optional[str], Optional[str], str]]:
+        """(id, link, reason, status) of every post whose latest status is an error or skipped."""
+        with self.lock:
+            return self.db.execute("SELECT id, url, error, status FROM posts WHERE status IN ('error', 'skipped') "
+                                   "ORDER BY updated, id").fetchall()
 
     def close(self) -> None:
         with self.lock:
@@ -690,8 +863,10 @@ class Post:
         self.id = str(item["id"])
         self.base = base_name(item)
         self.work = work / self.id
-        self.tasks: list[tuple[list[str], Path, int]] = []   # (mirrors, dest, expected size)
+        self.tasks: list[tuple[list[str], Path, dict[str, int]]] = []   # (mirrors, dest, {url: expected size})
         self.hidden: Optional[str] = None                    # reason when TikTok gives no download link
+        self.permanent = False                               # True when no re-run can ever download it
+        self.incomplete = False                              # every video download came out truncated
         video = item.get("video") or {}
         images = (item.get("imagePost") or {}).get("images") or []
         self.is_slide = bool(images)
@@ -701,11 +876,11 @@ class Post:
         if self.is_slide:
             self.images = [self.work / f"img_{i:02d}.jpg" for i in range(1, len(images) + 1)]
             for img, dest in zip(images, self.images):
-                self.tasks.append((uniq((img.get("imageURL") or {}).get("urlList") or []), dest, 0))
+                self.tasks.append((uniq((img.get("imageURL") or {}).get("urlList") or []), dest, {}))
             play = (item.get("music") or {}).get("playUrl")
             self.audio = self.work / "audio.mp3" if play else None
             if play:
-                self.tasks.append(([play], self.audio, 0))
+                self.tasks.append(([play], self.audio, {}))
             return
 
         # These URLs are NOT mirrors of the same file: www.tiktok.com/aweme/v1/play returns HTML and
@@ -716,6 +891,7 @@ class Post:
         if not mirrors:
             # TikTok withholds the video URL on purpose, typically for ad / TikTok Shop posts.
             if item.get("isAd") or item.get("isECVideo"):
+                self.permanent = True
                 self.hidden = t("ad / TikTok Shop video: TikTok does not provide a download link on the web "
                                 "(even when logged in)",
                                 "video quảng cáo / TikTok Shop: TikTok không cung cấp link tải qua web "
@@ -726,12 +902,15 @@ class Post:
                                 "TikTok không trả link tải cho video này (có thể bị giới hạn), thử lại với --session-id")
             return
         self.video = self.work / "video.mp4"
-        self.tasks.append((mirrors, self.video, to_int(struct.get("DataSize")) or to_int(video.get("size")) or 0))
+        # The reported size describes playAddr / PlayAddrStruct only, not the watermarked downloadAddr.
+        size = to_int(struct.get("DataSize")) or to_int(video.get("size")) or 0
+        sized = {video.get("playAddr"), *(struct.get("UrlList") or [])}
+        self.tasks.append((mirrors, self.video, {u: size for u in mirrors if size and u in sized}))
 
         cover = video.get("originCover") or video.get("cover")
         self.cover = self.work / "cover.img" if cover and opts.cover else None
         if self.cover:
-            self.tasks.append(([cover], self.cover, 0))
+            self.tasks.append(([cover], self.cover, {}))
 
         self.subs: list[tuple[Path, str]] = []
         seen = set()
@@ -744,13 +923,14 @@ class Post:
             seen.add(lang)
             dest = self.work / f"sub_{len(self.subs)}.vtt"
             self.subs.append((dest, lang))
-            self.tasks.append(([sub["Url"]], dest, 0))
+            self.tasks.append(([sub["Url"]], dest, {}))
 
 
-def is_valid_file(dest: Path) -> bool:
-    """Reject "finished" downloads that are really HTML/JSON error pages."""
+def is_valid_file(dest: Path, expected: int = 0) -> bool:
+    """Reject "finished" downloads that are really HTML/JSON error pages, or that are smaller than
+    the size TikTok reports for them (expected, 0 = unknown)."""
     try:
-        if not dest.is_file() or dest.stat().st_size < 64 or Path(f"{dest}.aria2").exists():
+        if not dest.is_file() or dest.stat().st_size < max(64, expected) or Path(f"{dest}.aria2").exists():
             return False
         with open(dest, "rb") as fh:
             head = fh.read(16)
@@ -765,63 +945,123 @@ def is_valid_file(dest: Path) -> bool:
     return True
 
 
-def download_aria2(aria2: str, tasks, cookie: str, jobs: int, conns: int, work: Path, attempt: int) -> None:
+# Set on Ctrl+C. Worker threads check it so queued work is dropped instead of finished.
+STOP = threading.Event()
+
+
+def wait_result(fut):
+    """fut.result(), but Ctrl+C can interrupt the wait (a blocking result() may not, on Windows)."""
+    while not fut.done():
+        time.sleep(0.1)
+    return fut.result()
+
+
+def is_truncated(dest: Path, expected: int) -> bool:
+    """A download with valid content that stops short of the size TikTok reports."""
+    try:
+        return bool(expected) and is_valid_file(dest) and dest.stat().st_size < expected
+    except OSError:
+        return False
+
+
+def download_aria2(aria2: str, tasks, cookie: str, jobs: int, conns: int, attempt: int) -> set[Path]:
+    """Run one aria2c pass with each task's mirror number `attempt`. Files that fail validation are
+    deleted, so the next pass retries them. Returns the files that came down truncated."""
+    # The download list goes to aria2c on stdin, with the cookie as a per-download option, so the
+    # session ID is neither in the command line (visible to other processes) nor in a file on disk.
     lines = []
-    for mirrors, dest, _ in tasks:
-        if attempt >= len(mirrors) or is_valid_file(dest):
+    queued = []
+    for mirrors, dest, sizes in tasks:
+        sizes = sizes or {}  # None/{}: no size reported for any mirror
+        # A file from an earlier pass was checked against its own URL then; a leftover from an
+        # earlier run is held to the reported size.
+        if attempt >= len(mirrors) or is_valid_file(dest, max(sizes.values(), default=0) if attempt == 0 else 0):
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         for leftover in (dest, Path(f"{dest}.aria2")):
             leftover.unlink(missing_ok=True)
-        # The cookie may hold the user's sessionid: keep it in the input file (deleted below),
-        # not on the command line where other programs can read it.
-        lines += [mirrors[attempt], f"  dir={dest.parent}", f"  out={dest.name}", f"  header=Cookie: {cookie}"]
+        lines += [mirrors[attempt], f"  dir={dest.parent}", f"  out={dest.name}"]
+        if cookie:
+            lines.append(f"  header=Cookie: {cookie}")
+        queued.append((dest, sizes.get(mirrors[attempt], 0)))
     if not lines:
-        return
-    work.mkdir(parents=True, exist_ok=True)
-    inp = work / "aria2-input.txt"
-    inp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return set()
     cmd = [
-        aria2, f"--input-file={inp}", f"--max-concurrent-downloads={jobs}",
+        aria2, "--input-file=-", f"--max-concurrent-downloads={jobs}",
         f"--max-connection-per-server={conns}", f"--split={conns}", "--min-split-size=1M",
         "--continue=true", "--allow-overwrite=true", "--auto-file-renaming=false",
         "--file-allocation=none", "--max-tries=5", "--retry-wait=2", "--timeout=30",
         "--connect-timeout=15", "--quiet=true", f"--user-agent={UA}",
         "--referer=https://www.tiktok.com/", "--header=Accept: */*",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        proc.wait()
+        # Wait in short steps instead of one blocking communicate(): on Windows Ctrl+C cannot
+        # interrupt a blocking wait, so STOP would only be set once aria2c exits, while ffmpeg jobs
+        # keep running and starting meanwhile.
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        while True:
+            try:
+                proc.communicate(data, timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                data = None  # already handed over: later calls only wait for aria2c to exit
     except KeyboardInterrupt:
+        STOP.set()
         proc.terminate()
         raise
-    finally:
-        inp.unlink(missing_ok=True)
+    truncated = {dest for dest, expected in queued if is_truncated(dest, expected)}
+    for dest, expected in queued:
+        if not is_valid_file(dest, expected):
+            dest.unlink(missing_ok=True)
+    return truncated
 
 
-def download_requests(session: requests.Session, tasks, jobs: int) -> None:
+def download_requests(session: requests.Session, tasks, jobs: int) -> set[Path]:
+    """Download with plain requests. Returns the files that came down truncated at least once."""
+    truncated: set[Path] = set()
+
     def one(task):
-        mirrors, dest, _ = task
-        if is_valid_file(dest):
+        mirrors, dest, sizes = task
+        sizes = sizes or {}  # None/{}: no size reported for any mirror
+        if STOP.is_set() or is_valid_file(dest, max(sizes.values(), default=0)):
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
         for url in mirrors:
+            expected = sizes.get(url, 0)  # the watermarked downloadAddr has no reported size
             for _ in range(3):
+                if STOP.is_set():
+                    break
                 try:
                     with session.get(url, stream=True, timeout=30) as r:
                         r.raise_for_status()
                         with open(dest, "wb") as fh:
                             for chunk in r.iter_content(1 << 16):
+                                if STOP.is_set():
+                                    break
                                 fh.write(chunk)
-                    if is_valid_file(dest):
+                    if STOP.is_set():
+                        break  # Ctrl+C mid-download: the partial file is deleted below
+                    if is_valid_file(dest, expected):
                         return
-                    break  # got an error page instead of media: try the next URL
+                    if not is_truncated(dest, expected):
+                        break  # got an error page instead of media: try the next URL
+                    truncated.add(dest)  # cut short: delete it and retry
+                    dest.unlink(missing_ok=True)
                 except requests.RequestException:
-                    time.sleep(1)
+                    STOP.wait(1)
         dest.unlink(missing_ok=True)
 
-    with ThreadPoolExecutor(jobs) as pool:
-        list(pool.map(one, tasks))
+    pool = ThreadPoolExecutor(jobs)
+    try:
+        for fut in [pool.submit(one, task) for task in tasks]:
+            wait_result(fut)
+    except KeyboardInterrupt:
+        STOP.set()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=STOP.is_set())
+    return truncated
 
 
 # --------------------------------------------------------------------------- #
@@ -829,10 +1069,20 @@ def download_requests(session: requests.Session, tasks, jobs: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
+    # Ctrl+C reaches ffmpeg too and makes it fail. Report that as "stopped", so mux_video() does not
+    # start a fallback attempt (e.g. without the cover) and record the post as done.
+    if STOP.is_set():
+        raise ScrapeError(t("stopped", "đã dừng"))
     try:
         p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except OSError as e:   # ffmpeg missing or not executable
         return False, str(e)
+    # ffmpeg can exit from Ctrl+C a moment before the main thread sets STOP. For an exit code that
+    # looks like a signal (255 from ffmpeg's own handler, 0xC000013A on Windows, <0 on POSIX),
+    # give STOP a second to be set before treating it as a real error.
+    by_signal = p.returncode < 0 or p.returncode in (255, 0xC000013A)
+    if p.returncode and STOP.wait(1 if by_signal else 0):
+        raise ScrapeError(t("stopped", "đã dừng"))
     return p.returncode == 0, p.stderr.decode("utf-8", "replace").strip()[-400:]
 
 
@@ -842,6 +1092,18 @@ def tag_args(tags: dict) -> list[str]:
         if v:
             out += ["-metadata", f"{k}={v}"]
     return out
+
+
+def mux_attempts(has_cover: bool, has_subs: bool) -> list[tuple[bool, bool]]:
+    """(with_cover, with_subs) for each ffmpeg attempt, most complete first.
+
+    Only parts the post really has are tried, so no two attempts run the same command."""
+    attempts = []
+    for with_cover, with_subs in ((True, True), (False, True), (False, False)):
+        attempt = (with_cover and has_cover, with_subs and has_subs)
+        if attempt not in attempts:
+            attempts.append(attempt)
+    return attempts
 
 
 def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
@@ -869,13 +1131,7 @@ def mux_video(ffmpeg: str, post: Post, out: Path) -> str:
         return cmd + tags + ["-movflags", "+faststart", str(out)]
 
     # If the cover (sometimes an odd HEIC/WebP) or a subtitle breaks ffmpeg, drop them one at a time.
-    attempts = [(True, True)]
-    if cover:
-        attempts.append((False, True))
-    if subs:
-        attempts.append((False, False))
-    err = ""
-    for with_cover, with_subs in attempts:
+    for with_cover, with_subs in mux_attempts(bool(cover), bool(subs)):
         ok, err = run_ffmpeg(build(with_cover, with_subs))
         if ok:
             notes = []
@@ -920,7 +1176,6 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
     """Mux/move files of one post into out_dir. Returns (main file name, total bytes, note)."""
     when = created_at(post.item).timestamp()
     produced: list[Path] = []
-
     notes: list[str] = []
 
     if post.is_slide:
@@ -939,6 +1194,8 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
                 os.replace(tmp, main)
                 produced.append(main)
             except ScrapeError as e:
+                if STOP.is_set():
+                    raise   # Ctrl+C: leave the post unfinished so the next run builds it properly
                 notes.append(t("slideshow failed, images saved", "không dựng được slideshow, đã lưu ảnh"))
                 log(warn(f"{post.url}: {e}"))
         # Images are saved when asked, and always when there is no slideshow (so nothing is lost).
@@ -954,6 +1211,11 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
         main = main or produced[0]
     else:
         if not post.video.exists() or post.video.stat().st_size < 1024:
+            if post.incomplete:
+                raise ScrapeError(t("video download incomplete: the file is smaller than the size TikTok "
+                                    "reports (every link was tried)",
+                                    "tải video không trọn vẹn: file nhỏ hơn dung lượng TikTok báo "
+                                    "(đã thử hết các link tải)"))
             raise ScrapeError(t("video could not be downloaded", "không tải được video"))
         main = out_dir / f"{post.base}.mp4"
         muxed = False
@@ -966,6 +1228,8 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
                 if note:
                     notes.append(note)
             except ScrapeError as e:
+                if STOP.is_set():
+                    raise   # Ctrl+C: leave the post unfinished so the next run muxes it properly
                 # Keep the downloaded video even when ffmpeg fails.
                 notes.append(t("ffmpeg failed, saved without metadata", "ffmpeg lỗi, đã lưu video chưa gắn metadata"))
                 log(warn(f"{post.url}: {e}"))
@@ -990,6 +1254,11 @@ def finalize(post: Post, out_dir: Path, ffmpeg: Optional[str], opts) -> tuple[st
 def save_profile(tt: TikTok, username: str, out_dir: Path) -> Optional[dict]:
     try:
         info = tt.user(username)
+    except RateLimited:
+        raise
+    except Challenged as e:
+        # Stop this profile now: the post list (yt-dlp) would only fail with a misleading error.
+        raise Challenged(f"@{username}: {e}") from None
     except ScrapeError as e:
         if e.code in FATAL_PROFILE_CODES:
             raise ScrapeError(f"@{username}: {e}", e.code)
@@ -1035,11 +1304,43 @@ def write_csv(out_dir: Path) -> int:
     return len(rows)
 
 
+def write_failed_file(progress: Progress, out_dir: Path, username: str, stop_note: Optional[str] = None) -> int:
+    """Rebuild failed.txt from the progress database, so it lists every post of the profile that is
+    still failing, not only this run's failures. `stop_note` (why the run stopped early) is added to
+    the header. Removed when nothing fails and there is no stop note. Returns the failing post count."""
+    failed_file = out_dir / "failed.txt"
+    failures = progress.failures()
+    if not failures and not stop_note:
+        failed_file.unlink(missing_ok=True)
+        return 0
+    n = len(failures)
+    lines = [t(f"# @{username} - {n} posts could not be downloaded - {datetime.now():%Y-%m-%d %H:%M}",
+               f"# @{username} - {n} bài không tải được - {datetime.now():%Y-%m-%d %H:%M}"),
+             t("# Run the same command again to retry. Open each link to check the post yourself.",
+               "# Chạy lại đúng lệnh cũ để thử lại. Mở từng link để tự kiểm tra bài đó."), ""]
+    if any(state == "skipped" for *_, state in failures):
+        lines.insert(2, t("# Posts marked (skipped) can never be downloaded and are not tried again; "
+                          "use --retry-all to try them anyway.",
+                          "# Bài có ghi (bỏ qua) không bao giờ tải được nên sẽ không thử lại; "
+                          "thêm --retry-all nếu vẫn muốn thử."))
+    if stop_note:
+        lines.insert(2, stop_note)
+    for pid, url, reason, state in failures:
+        # Rows written by older versions have no link: fall back to the /video/ form.
+        url = url or f"https://www.tiktok.com/@{username}/video/{pid}"
+        note = t("  (skipped)", "  (bỏ qua)") if state == "skipped" else ""
+        lines.append(f"{url}\n    {reason or t('unknown error', 'lỗi không rõ')}{note}")
+    failed_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return n
+
+
 def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str]) -> int:
+    target = resolve_short_link(target.strip())   # keep the full link: it tells photo posts apart
     username, single = parse_target(target)
     out_dir = Path(opts.output).resolve() / username
     (out_dir / "metadata").mkdir(parents=True, exist_ok=True)
     work = out_dir / ".parts"   # temporary files, created only when something is downloaded
+    (work / "session-cookies.txt").unlink(missing_ok=True)  # left behind by older versions
     tt = TikTok(opts.session_id, opts.wait, opts.proxy)
 
     log("\n" + bold_cyan(f"━━ @{username} ") + gray("━" * max(4, 40 - len(username))))
@@ -1053,15 +1354,12 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
             f"{bold(fmt_int(st.get('videoCount')))} {gray(t('posts', 'bài đăng'))}")
 
     if single:
-        entries = [{"id": single}]
+        entries = [{"id": single, "url": target}]
     else:
-        cookiefile = write_cookie_file(opts.session_id) if opts.session_id else None
         try:
-            entries = list_posts(username, opts.limit, cookiefile)
+            entries = list_posts_with_session(username, opts.limit, opts.session_id)
         finally:
             status("")
-            if cookiefile:
-                Path(cookiefile).unlink(missing_ok=True)
         found = bold(len(entries))
         log(gray(t("  Found ", "  Tìm thấy ")) + found + gray(t(" post." if len(entries) == 1 else " posts.", " bài đăng.")))
         if not entries:
@@ -1075,26 +1373,37 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     else:
         pending = [e for e in entries if not progress.done(str(e["id"]), out_dir)
                    or (opts.keep_images and missing_photos(out_dir, str(e["id"])))]
-    if len(pending) < len(entries):
-        skipped = len(entries) - len(pending)
-        log(gray(t(f"  Skipping {skipped} posts already downloaded.", f"  Bỏ qua {skipped} bài đã có.")))
+    finished = len(entries) - len(pending)
+    if not opts.retry_all:
+        never = progress.skipped()
+        pending = [e for e in pending if str(e["id"]) not in never]
+    permanent = len(entries) - finished - len(pending)
+    if finished and not permanent:
+        log(gray(t(f"  Skipping {finished} posts already downloaded.", f"  Bỏ qua {finished} bài đã có.")))
+    elif permanent:
+        log(gray(t(f"  Skipping {finished + permanent} posts: {finished} already downloaded, {permanent} that "
+                   "can never be downloaded (deleted / ad posts, see failed.txt; --retry-all to try again).",
+                   f"  Bỏ qua {finished + permanent} bài: {finished} bài đã có, {permanent} bài không bao giờ tải "
+                   "được (đã xoá / quảng cáo, xem failed.txt; thêm --retry-all để thử lại).")))
 
     n = len(pending)
     if not n:
-        progress.close()
         log(green(t("  ✓ Nothing left to download.", "  ✓ Không còn bài nào cần tải.")))
         write_csv(out_dir)
+        write_failed_file(progress, out_dir, username)
+        progress.close()
         return 0
     log(gray(t(f"  Processing {n} post{'s' if n != 1 else ''} → ", f"  Bắt đầu xử lý {n} bài → "))
         + blue(str(out_dir)) + "\n")
     started = time.monotonic()
     tally = {"ok": 0, "failed": 0, "bytes": 0, "dl_bytes": 0, "dl_secs": 0.0}
     tally_lock = threading.Lock()
-    failures: list[tuple[str, str]] = []   # (link bài, lý do)
     bar = ProgressBar(n)
 
-    def post_url(pid: str) -> str:
-        return f"https://www.tiktok.com/@{username}/video/{pid}"
+    def post_url(entry: dict) -> str:
+        # Before the post page is read, only a /photo/ link (e.g. the one the user gave) marks a photo post.
+        kind = "photo" if "/photo/" in (entry.get("url") or "").lower() else "video"
+        return f"https://www.tiktok.com/@{username}/{kind}/{entry['id']}"
 
     def succeed(line: str, size: int = 0) -> None:
         with tally_lock:
@@ -1106,28 +1415,40 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     def fail(url: str, reason: str) -> None:
         with tally_lock:
             tally["failed"] += 1
-            failures.append((url, reason))
         bar.post_done(False)
         log(f"  {bold_red('✗')} {link(url)}\n      {gray('└')} {yellow(reason)}")
 
     def fetch(entry):
+        if STOP.is_set():
+            return entry, None, t("stopped", "đã dừng")
         try:
             return entry, tt.item(username, str(entry["id"])), None
+        except RateLimited:
+            raise
         except ScrapeError as e:
-            return entry, None, str(e)
-        except Exception as e:   # never let one post stop the whole run
-            return entry, None, f"{type(e).__name__}: {e}"
+            return entry, None, e
+        except Exception as e:   # an odd page must fail only this post, not the whole batch
+            return entry, None, t(f"unexpected page format ({type(e).__name__}: {e})",
+                                  f"trang có định dạng không như dự kiến ({type(e).__name__}: {e})")
 
     def fetch_batch(batch):
         with ThreadPoolExecutor(opts.workers) as pool:
             return list(pool.map(fetch, batch))
 
     def finish(post: Post) -> None:
+        if STOP.is_set():
+            return
         try:
             name, size, note = finalize(post, out_dir, ffmpeg, opts)
-        except Exception as e:   # never let one post stop the whole run
-            reason = str(e) if isinstance(e, (ScrapeError, OSError)) else f"{type(e).__name__}: {e}"
-            progress.mark(post.id, "error", error=reason)
+        except (ScrapeError, OSError) as e:
+            if STOP.is_set():
+                return  # cut short by Ctrl+C: left unmarked so the next run retries it
+            progress.mark(post.id, "error", error=str(e), url=post.url)
+            fail(post.url, str(e))
+            return
+        except Exception as e:   # a bug or odd data in one post must not stop the run
+            reason = t(f"unexpected error ({type(e).__name__}: {e})", f"lỗi không lường trước ({type(e).__name__}: {e})")
+            progress.mark(post.id, "error", error=reason, url=post.url)
             fail(post.url, reason)
             return
         progress.mark(post.id, "done", file=name)
@@ -1149,11 +1470,13 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     meta_pool = ThreadPoolExecutor(1)
     mux_pool = ThreadPoolExecutor(opts.mux_jobs)
     mux_futures = []
+    completed = False
+    stopped: Optional[ChallengeStop] = None
     with bar:
         try:
             upcoming = meta_pool.submit(fetch_batch, batches[0])
             for bi, batch in enumerate(batches):
-                results = upcoming.result()
+                results = wait_result(upcoming)
                 cookie = tt.cookie_header()
                 upcoming = meta_pool.submit(fetch_batch, batches[bi + 1]) if bi + 1 < len(batches) else None
 
@@ -1161,25 +1484,30 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                 for entry, item, err in results:
                     pid = str(entry["id"])
                     if err:
-                        progress.mark(pid, "error", error=err)
-                        fail(post_url(pid), t(f"could not read the post page: {err}", f"không đọc được trang bài đăng: {err}"))
+                        reason = t(f"could not read the post page: {err}", f"không đọc được trang bài đăng: {err}")
+                        # getattr: err may also be a plain message string, not only a ScrapeError
+                        state = "skipped" if getattr(err, "code", 0) in PERMANENT_POST_CODES else "error"
+                        progress.mark(pid, state, error=reason, url=post_url(entry))
+                        fail(post_url(entry), reason)
+                        continue
+                    try:
+                        meta = flatten(item)
+                        post = None if opts.metadata_only else Post(item, work, opts)
+                    except Exception as e:   # odd field types in the post JSON: fail only this post
+                        reason = t(f"unexpected page format ({type(e).__name__}: {e})",
+                                   f"trang có định dạng không như dự kiến ({type(e).__name__}: {e})")
+                        progress.mark(pid, "error", error=reason, url=post_url(entry))
+                        fail(post_url(entry), reason)
                         continue
                     meta_path = out_dir / "metadata" / f"{pid}.json"
-                    meta_path.write_text(json.dumps({"metadata": flatten(item), "raw": item},
+                    meta_path.write_text(json.dumps({"metadata": meta, "raw": item},
                                                     ensure_ascii=False, indent=2), encoding="utf-8")
                     if opts.metadata_only:
                         progress.mark(pid, "metadata")
                         succeed(f"{gray('metadata')} {pid}")
                         continue
-                    try:
-                        post = Post(item, work, opts)
-                    except Exception as e:   # malformed post data
-                        reason = f"{type(e).__name__}: {e}"
-                        progress.mark(pid, "error", error=reason)
-                        fail(post_url(pid), reason)
-                        continue
                     if post.hidden:
-                        progress.mark(pid, "error", error=post.hidden)
+                        progress.mark(pid, "skipped" if post.permanent else "error", error=post.hidden, url=post.url)
                         fail(post.url, post.hidden)
                         continue
                     posts.append(post)
@@ -1193,13 +1521,16 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
                 t0 = time.monotonic()
                 try:
                     if aria2:
-                        for attempt in range(max((len(mirrors) for mirrors, _, _ in tasks), default=0)):
-                            download_aria2(aria2, tasks, cookie, opts.jobs, opts.connections, work, attempt)
+                        truncated: set[Path] = set()
+                        for attempt in range(max((len(task[0]) for task in tasks), default=0)):
+                            truncated |= download_aria2(aria2, tasks, cookie, opts.jobs, opts.connections, attempt)
                         for _, dest, _ in tasks:
                             if not is_valid_file(dest):
                                 dest.unlink(missing_ok=True)
                     else:
-                        download_requests(tt.s, tasks, opts.jobs)
+                        truncated = download_requests(tt.s, tasks, opts.jobs) or set()
+                    for post in posts:
+                        post.incomplete = not post.is_slide and post.video in truncated
                 finally:
                     bar.downloaded()
                 with tally_lock:
@@ -1209,28 +1540,35 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
 
                 mux_futures += [mux_pool.submit(finish, post) for post in posts]
             for fut in mux_futures:
-                fut.result()
+                wait_result(fut)
+            completed = True
+        except KeyboardInterrupt:
+            STOP.set()
+            raise
+        except ChallengeStop as e:
+            stopped = e  # write failed.txt first, then stop the run
         finally:
+            tt.stop()  # queued page reads of an aborted batch give up instead of running on
             meta_pool.shutdown(wait=False, cancel_futures=True)
-            # Finish the mux jobs already running; drop queued ones if we are stopping on an error.
-            mux_pool.shutdown(wait=True, cancel_futures=sys.exc_info()[0] is not None)
-            progress.close()
+            # On Ctrl+C, drop queued mux jobs; running ones were stopped by Ctrl+C too and end quickly.
+            mux_pool.shutdown(wait=True, cancel_futures=STOP.is_set())
+            if not completed and not stopped:
+                progress.close()   # the run is ending with an error: nothing below runs
 
     ok, failed, total_bytes = tally["ok"], tally["failed"], tally["bytes"]
     rows = write_csv(out_dir)
     if not opts.keep_parts and work.exists() and not any(p.is_dir() for p in work.iterdir()):
         shutil.rmtree(work, ignore_errors=True)
 
-    failed_file = out_dir / "failed.txt"
-    if failures:
-        lines = [t(f"# @{username} - {len(failures)} posts could not be downloaded - {datetime.now():%Y-%m-%d %H:%M}",
-                   f"# @{username} - {len(failures)} bài không tải được - {datetime.now():%Y-%m-%d %H:%M}"),
-                 t("# Run the same command again to retry. Open each link to check the post yourself.",
-                   "# Chạy lại đúng lệnh cũ để thử lại. Mở từng link để tự kiểm tra bài đó."), ""]
-        lines += [f"{url}\n    {reason}" for url, reason in failures]
-        failed_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        failed_file.unlink(missing_ok=True)
+    stop_note = None
+    if stopped:
+        left = n - ok - failed
+        stop_note = t(f"# The run stopped early, {left} posts were not processed: {stopped}",
+                      f"# Tool đã dừng sớm, còn {left} bài chưa xử lý: {stopped}")
+    all_failed = write_failed_file(progress, out_dir, username, stop_note)
+    progress.close()
+    if stopped:
+        raise stopped
 
     secs = max(1.0, time.monotonic() - started)
     dot = gray(" · ")
@@ -1246,8 +1584,11 @@ def scrape_profile(target: str, opts, aria2: Optional[str], ffmpeg: Optional[str
     log(counts)
     log(gray(t("  Folder: ", "  Thư mục: ")) + blue(str(out_dir))
         + gray(t(f"  (videos.csv: {rows} post{'s' if rows != 1 else ''})", f"  (videos.csv: {rows} bài)")))
-    if failures:
-        log(yellow(t("  Failed posts with links: ", "  Danh sách bài lỗi kèm link: ")) + blue(str(failed_file)))
+    if all_failed:
+        # Counts every failing post of the profile, including ones from earlier runs.
+        log(yellow(t(f"  Failed posts with links ({all_failed}): ", f"  Danh sách bài lỗi kèm link ({all_failed}): "))
+            + blue(str(out_dir / "failed.txt")))
+    if failed:
         log(gray(t("  Run the same command again to retry failed posts (finished posts are skipped).",
                    "  Chạy lại đúng lệnh cũ để thử lại các bài lỗi (bài đã xong sẽ được bỏ qua).")))
     return failed
@@ -1288,9 +1629,9 @@ def main() -> None:
                           "số kết nối aria2c cho mỗi file, tối đa 16 (mặc định: 16)"))
     p.add_argument("-w", "--workers", type=int, default=8,
                    help=t("threads reading metadata (default: 8)", "số luồng đọc metadata (mặc định: 8)"))
-    p.add_argument("--wait", type=float, default=0.1,
-                   help=t("seconds between TikTok page requests (default: 0.1)",
-                          "giãn cách giữa các request trang TikTok, giây (mặc định: 0.1)"))
+    p.add_argument("--wait", type=float, default=0.3,
+                   help=t("seconds between TikTok page requests (default: 0.3)",
+                          "giãn cách giữa các request trang TikTok, giây (mặc định: 0.3)"))
     p.add_argument("--batch", type=int, default=50,
                    help=t("posts per read-download-mux batch (default: 50)", "số bài mỗi lô đọc-tải-mux (mặc định: 50)"))
     p.add_argument("--mux-jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)),
@@ -1317,13 +1658,19 @@ def main() -> None:
                           "số giây mỗi ảnh trong slideshow (mặc định: 3)"))
     p.add_argument("--keep-parts", action="store_true",
                    help=t("keep temporary files in .parts/", "giữ lại file tạm trong .parts/"))
+    p.add_argument("--retry-all", action="store_true",
+                   help=t("also retry posts that can never be downloaded (deleted, ad / TikTok Shop), "
+                          "which re-runs skip by default",
+                          "thử lại cả những bài không bao giờ tải được (đã xoá, quảng cáo / TikTok Shop) "
+                          "mà mặc định các lần chạy lại sẽ bỏ qua"))
     p.add_argument("--session-id",
-                   help=t('your TikTok "sessionid" cookie (age-restricted posts, private accounts you follow)',
+                   help=t('your TikTok "sessionid" cookie (age-restricted posts, private accounts you follow); '
+                          'safer: set the TIKTOK_SESSIONID environment variable instead',
                           'cookie "sessionid" tài khoản TikTok của bạn (bài giới hạn tuổi, '
-                          'tài khoản riêng tư bạn theo dõi)'))
+                          'tài khoản riêng tư bạn theo dõi); an toàn hơn: đặt biến môi trường TIKTOK_SESSIONID'))
     p.add_argument("--check-session", action="store_true",
-                   help=t("only check whether --session-id is logged in, then exit",
-                          "chỉ kiểm tra --session-id có đăng nhập được không rồi thoát"))
+                   help=t("only check whether the session ID is logged in, then exit",
+                          "chỉ kiểm tra session ID có đăng nhập được không rồi thoát"))
     p.add_argument("--proxy", help=t("proxy for TikTok page requests, e.g. http://127.0.0.1:8080",
                                      "proxy cho request trang TikTok, vd http://127.0.0.1:8080"))
     p.add_argument("--lang", choices=("en", "vi"), default=LANG,
@@ -1340,13 +1687,14 @@ def main() -> None:
     opts.workers = max(1, min(16, opts.workers))
     opts.batch = max(1, opts.batch)
     opts.mux_jobs = max(1, opts.mux_jobs)
+    opts.session_id = resolve_session_id(opts.session_id)
     if opts.limit is not None and opts.limit < 1:
         p.error(t("-n/--limit must be 1 or more", "-n/--limit phải từ 1 trở lên"))
     if opts.slide_seconds < 0.5:
         p.error(t("--slide-seconds must be at least 0.5", "--slide-seconds phải từ 0.5 trở lên"))
     if opts.check_session and not opts.session_id:
-        p.error(t("--check-session needs --session-id <sessionid>",
-                  "--check-session cần đi kèm --session-id <sessionid>"))
+        p.error(t("--check-session needs a session ID: set TIKTOK_SESSIONID or add --session-id <sessionid>",
+                  "--check-session cần session ID: đặt biến TIKTOK_SESSIONID hoặc thêm --session-id <sessionid>"))
     if not opts.targets and not opts.check_session:
         p.error(t("enter at least one profile (username, @username or link)",
                   "cần nhập ít nhất một profile (username, @username hoặc link)"))
@@ -1384,9 +1732,29 @@ def main() -> None:
         for target in opts.targets:
             try:
                 failed += scrape_profile(target, opts, aria2, ffmpeg)
+            except RateLimited:
+                raise
             except ScrapeError as e:
                 failed += 1
                 log(bold_red(t("Error: ", "Lỗi: ")) + red(str(e)), err=True)
+    except ChallengeStop:
+        log("\n" + bold_red(t("✗ TikTok's bot protection keeps blocking requests (challenge page), so the run stopped.",
+                               "✗ Lớp chống bot của TikTok liên tục chặn request (trang xác minh) nên tool đã dừng."))
+            + "\n" + yellow(t("  Finished posts are kept. Try again later or from another network (VPN off, a "
+                              "different connection) with the same command to continue; --session-id doesn't "
+                              "help with this.",
+                              "  Các bài đã xong vẫn được giữ. Hãy chạy lại đúng lệnh cũ sau một lúc hoặc bằng mạng "
+                              "khác (tắt VPN, đổi kết nối) để tải tiếp; --session-id không giúp được trường hợp "
+                              "này.")), err=True)
+        sys.exit(1)
+    except RateLimited:
+        log("\n" + bold_red(t("✗ TikTok keeps refusing requests (HTTP 429/403), so the run stopped.",
+                               "✗ TikTok liên tục từ chối request (HTTP 429/403) nên tool đã dừng.")) + "\n"
+            + yellow(t("  Wait a while (or use a larger --wait / fewer --workers), then run the same "
+                       "command again to continue.",
+                       "  Hãy đợi một lúc (hoặc tăng --wait / giảm --workers), rồi chạy lại đúng lệnh cũ "
+                       "để tải tiếp.")), err=True)
+        sys.exit(1)
     except KeyboardInterrupt:
         log("\n" + yellow(t("Stopped. Run the same command again to continue.",
                              "Đã dừng. Chạy lại đúng lệnh cũ để tải tiếp.")), err=True)
