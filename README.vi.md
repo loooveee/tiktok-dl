@@ -136,7 +136,18 @@ dòng lệnh mà chương trình khác đọc được, và file tạm yt-dlp c�
 
 ## Đóng góp
 
-Mọi báo lỗi và pull request đều được hoan nghênh. Xem [CONTRIBUTING.md](CONTRIBUTING.md) (tiếng Anh).
+Mọi báo lỗi và pull request đều được hoan nghênh. Các thay đổi nhằm vượt qua lớp bảo vệ của TikTok (giả chữ ký
+request, giải captcha) sẽ không được nhận.
+
+- **Báo lỗi:** mở [issue](https://github.com/loooveee/tiktok-dl/issues), ghi lệnh đã chạy, nội dung lỗi (hoặc các
+  dòng trong `failed.txt`), hệ điều hành và `python --version`.
+- **Gửi bản sửa:** fork repo, tạo nhánh mới, commit, push lên bản fork của bạn, rồi bấm **Compare & pull request**
+  trên GitHub. Ghi rõ đã sửa gì, vì sao, và đã thử thế nào.
+- **Quy tắc:**
+  - Giữ mọi thứ trong `tiktok-dl.py`. Phần docstring đầu file có sơ đồ code.
+  - Mọi thông báo viết hai ngôn ngữ: `t("English", "Tiếng Việt")`.
+  - Dùng các hàm màu (`green()`, `red()`...) thay vì mã ANSI trực tiếp.
+  - Trước khi gửi, thử ít nhất `python tiktok-dl.py tiktok -n 5`, một bài ảnh, và `--lang vi`.
 
 ## Miễn trừ trách nhiệm
 

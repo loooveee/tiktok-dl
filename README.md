@@ -136,7 +136,18 @@ command line other programs can see, and the temporary file yt-dlp needs is dele
 
 ## Contributing
 
-Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports and pull requests are welcome. Changes that bypass TikTok's protections (forging request
+signatures, solving captchas) will not be accepted.
+
+- **Report a bug:** open an [issue](https://github.com/loooveee/tiktok-dl/issues) with the command you
+  ran, the error text (or the lines from `failed.txt`), your OS and `python --version`.
+- **Send a fix:** fork the repo, create a branch, commit, push it to your fork, then click
+  **Compare & pull request** on GitHub. Say what you changed, why, and how you tested it.
+- **Rules:**
+  - Keep everything in `tiktok-dl.py`. The docstring at the top has a code map.
+  - Write every message in both languages: `t("English", "Tiếng Việt")`.
+  - Use the color helpers (`green()`, `red()`...) instead of raw ANSI codes.
+  - Before sending, test at least `python tiktok-dl.py tiktok -n 5`, a photo post, and `--lang vi`.
 
 ## Disclaimer
 
