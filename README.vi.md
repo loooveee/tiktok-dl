@@ -78,7 +78,9 @@ https://www.tiktok.com/@username/video/1234567890123456789
     video quảng cáo / TikTok Shop: TikTok không cung cấp link tải qua web (kể cả khi đã đăng nhập)
 ```
 
-`failed.txt` được cập nhật sau mỗi lần chạy và tự xoá khi không còn bài nào lỗi.
+`failed.txt` liệt kê mọi bài của profile vẫn còn lỗi qua các lần chạy, và tự xoá khi không còn bài nào lỗi.
+Bài không bao giờ tải được (đã xoá, quảng cáo / TikTok Shop) được ghi `(bỏ qua)` và sẽ không thử lại ở các
+lần chạy sau. Thêm `--retry-all` nếu vẫn muốn thử.
 
 ## Lấy session ID (không bắt buộc)
 
@@ -102,13 +104,20 @@ Chỉ cần khi tải **tài khoản riêng tư bạn đang theo dõi** hoặc *
    ```
    Tool sẽ tự kiểm tra session trước, nếu không hợp lệ thì dừng lại.
 
+   **An toàn hơn:** đặt session ID vào biến môi trường `TIKTOK_SESSIONID` thay vì gõ trong lệnh, để nó không
+   nằm lại trong lịch sử lệnh. Trong PowerShell:
+   ```bash
+   $env:TIKTOK_SESSIONID = "DAN_SESSIONID_VAO_DAY"
+   python tiktok-dl.py username
+   ```
+
 > [!CAUTION]
 > `sessionid` có tác dụng như mật khẩu. **Tuyệt đối không chia sẻ** hay đăng lên mạng.
 > Nếu bạn đăng xuất TikTok thì session ID sẽ hết hiệu lực, cần copy lại cái mới.
 > Nên dùng **tài khoản phụ** cho an toàn.
 
-Tool không lưu lại session ID của bạn: nó chỉ được dùng trong lúc lệnh đang chạy, các file tạm chứa
-session ID sẽ bị xoá ngay sau đó.
+Tool không lưu lại session ID của bạn: nó chỉ được dùng trong lúc lệnh đang chạy, không bao giờ nằm trên
+dòng lệnh mà chương trình khác đọc được, và file tạm yt-dlp cần sẽ bị xoá ngay sau đó.
 
 ## Gặp lỗi?
 
@@ -117,6 +126,12 @@ session ID sẽ bị xoá ngay sau đó.
 - **Video quảng cáo / TikTok Shop bị lỗi:** TikTok không cung cấp link tải cho loại video này qua web, kể cả khi đã đăng nhập. Chúng được liệt kê trong `failed.txt` để bạn tự mở xem
 - **Tài khoản riêng tư:** thêm `--session-id <cookie sessionid của bạn>`
 - **"Không tìm thấy bài nào":** tài khoản đang để riêng tư, chưa có bài, hoặc TikTok tạm chặn. Mở profile bằng trình duyệt để kiểm tra, rồi thử lại sau
+- **"TikTok đang giới hạn request (HTTP 429/403)":** tool tự chậm lại và thử lại. Nếu vẫn bị liên tục thì tool
+  dừng; hãy đợi một lúc rồi chạy lại đúng lệnh cũ (hoặc tăng `--wait`, giảm `--workers`)
+- **"Lớp chống bot của TikTok đã chặn request (trang xác minh)":** TikTok đang hiện trang xác minh thay vì bài
+  đăng. Tool không tìm cách vượt qua mà dừng lại sau vài lần liền. Hãy thử lại sau hoặc dùng mạng khác (tắt VPN,
+  đổi kết nối). `--session-id` không giúp được trường hợp này
+- **Bấm Ctrl+C:** tool dừng ngay. Các bài đã xong vẫn được giữ, chạy lại đúng lệnh cũ để tải tiếp
 - **"(ffmpeg lỗi, đã lưu video chưa gắn metadata)":** video vẫn được tải và lưu, chỉ thiếu tiêu đề, ảnh bìa và phụ đề. Nếu bị thường xuyên thì cập nhật ffmpeg
 
 ## Đóng góp

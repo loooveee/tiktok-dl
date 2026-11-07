@@ -78,7 +78,9 @@ https://www.tiktok.com/@username/video/1234567890123456789
     ad / TikTok Shop video: TikTok does not provide a download link on the web (even when logged in)
 ```
 
-`failed.txt` is updated on every run and removed when nothing fails.
+`failed.txt` lists every post of the profile that still fails, across runs, and is removed when
+nothing fails. Posts that can never be downloaded (deleted, ad / TikTok Shop) are marked `(skipped)`
+and not tried again on the next runs. Add `--retry-all` to try them anyway.
 
 ## Get your session ID (optional)
 
@@ -102,13 +104,20 @@ You only need this for **private accounts you follow** or **age-restricted posts
    ```
    The tool checks the session first and stops if it is not valid.
 
+   **Safer:** put it in the `TIKTOK_SESSIONID` environment variable instead, so it does not end up in
+   your command history. In PowerShell:
+   ```bash
+   $env:TIKTOK_SESSIONID = "PASTE_YOUR_SESSIONID_HERE"
+   python tiktok-dl.py username
+   ```
+
 > [!CAUTION]
 > Your `sessionid` works like your password. **Never share it** or post it online.
 > If you log out of TikTok, the session ID stops working and you need to copy a new one.
 > Using a **secondary account** is safer.
 
-The tool does not keep your session ID: it is only used while the command runs, and the temporary
-files that hold it are deleted afterwards.
+The tool does not keep your session ID: it is only used while the command runs. It is never put on a
+command line other programs can see, and the temporary file yt-dlp needs is deleted right away.
 
 ## Problems?
 
@@ -117,6 +126,12 @@ files that hold it are deleted afterwards.
 - **Ad / TikTok Shop videos fail:** TikTok does not give a download link for these on the web, even when you are logged in. They are listed in `failed.txt` so you can open them yourself
 - **Private account:** add `--session-id <your sessionid cookie>`
 - **"No posts found":** the account is private or empty, or TikTok blocked the list for a while. Check the profile in your browser and try again later
+- **"TikTok is limiting requests (HTTP 429/403)":** the tool slows down and retries by itself. If it keeps
+  happening, it stops; wait a while and run the same command again (or use a larger `--wait`, fewer `--workers`)
+- **"TikTok's bot protection blocked the request (challenge page)":** TikTok is showing a verification page
+  instead of the posts. The tool does not try to get past it and stops after a few in a row. Try again later
+  or from another network (VPN off, a different connection). `--session-id` does not help here
+- **Ctrl+C:** stops right away. Finished posts are kept; run the same command again to continue
 - **"(ffmpeg failed, saved without metadata)":** the video was downloaded and saved, only the title, cover and subtitles could not be added. Update ffmpeg if it keeps happening
 
 ## Contributing
