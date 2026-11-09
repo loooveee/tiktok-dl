@@ -679,7 +679,12 @@ def list_posts(username: str, limit: Optional[int], cookiefile: Optional[str]) -
     except yt_dlp.utils.DownloadError as e:
         raise ScrapeError(t(f"yt-dlp could not get the post list ({e}). Try: pip install -U yt-dlp",
                              f"yt-dlp không lấy được danh sách bài đăng ({e}). Thử: pip install -U yt-dlp"))
-    return [e for e in (info or {}).get("entries") or [] if e and e.get("id")]
+    # Drop repeated ids (paged listings can repeat a post): two copies would share one .parts folder.
+    entries: dict[str, dict] = {}
+    for e in (info or {}).get("entries") or []:
+        if e and e.get("id"):
+            entries.setdefault(str(e["id"]), e)
+    return list(entries.values())
 
 
 def write_cookie_file(session_id: str) -> str:
@@ -783,7 +788,8 @@ def mux_tags(item: dict) -> dict:
     f = flatten(item)
     when = created_at(item)
     desc = item.get("desc") or ""
-    title = desc.splitlines()[0][:120] if desc.strip() else f"TikTok {item['id']}"
+    first = next((line.strip() for line in desc.splitlines() if line.strip()), "")
+    title = first[:120] or f"TikTok {item['id']}"
     comment = [
         f["url"],
         f"Views {fmt_int(f['plays'])} · Likes {fmt_int(f['likes'])} · Comments {fmt_int(f['comments'])}"
@@ -1293,14 +1299,20 @@ def write_csv(out_dir: Path) -> int:
     for f in sorted((out_dir / "metadata").glob("*.json")):
         try:
             rows.append(json.loads(f.read_text(encoding="utf-8"))["metadata"])
-        except (ValueError, KeyError):
+        except (OSError, ValueError, KeyError):
             continue
     rows.sort(key=lambda r: r.get("created") or "", reverse=True)
     if rows:
-        with open(out_dir / "videos.csv", "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), extrasaction="ignore")
-            w.writeheader()
-            w.writerows(rows)
+        # Columns from every row: metadata saved by an older version may lack newer fields.
+        fields = list(dict.fromkeys(k for r in rows for k in r))
+        try:
+            with open(out_dir / "videos.csv", "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+        except OSError as e:   # e.g. videos.csv is open in Excel, which locks it on Windows
+            log(warn(t(f"Could not write videos.csv ({e}). Close it and run again to update it.",
+                       f"Không ghi được videos.csv ({e}). Hãy đóng file rồi chạy lại để cập nhật.")))
     return len(rows)
 
 
@@ -1702,6 +1714,9 @@ def main() -> None:
     if opts.session_id:
         try:
             me = TikTok(opts.session_id, 0, opts.proxy).whoami()
+        except KeyboardInterrupt:
+            log("\n" + yellow(t("Stopped.", "Đã dừng.")), err=True)
+            sys.exit(130)
         except ScrapeError as e:
             log(bold_red(t("Error: ", "Lỗi: ")) + red(t(f"could not check the session ({e})", f"không kiểm tra được session ({e})")),
                 err=True)
@@ -1734,7 +1749,7 @@ def main() -> None:
                 failed += scrape_profile(target, opts, aria2, ffmpeg)
             except RateLimited:
                 raise
-            except ScrapeError as e:
+            except (ScrapeError, OSError) as e:   # OSError: e.g. output folder not writable, disk full
                 failed += 1
                 log(bold_red(t("Error: ", "Lỗi: ")) + red(str(e)), err=True)
     except ChallengeStop:
